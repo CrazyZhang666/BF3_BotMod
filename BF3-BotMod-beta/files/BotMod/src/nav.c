@@ -360,16 +360,25 @@ int nav_build_step(NavGrid *g, NavRayFn ray, int rayBudget, double maxMs)
 
 typedef struct NavFileHeader { unsigned magic; char level[32]; float x0, z0, cell; int w, h, layers; } NavFileHeader;
 
+static void blocks_restore_into(const NavGrid *g, unsigned char *edges);
 int nav_save(const NavGrid *g, const char *path)
 {
+    // The links as built + repaired - WITHOUT the temporary stuck-bot blocks (nav_block_towards: 3 minutes each). Saving
+    // g->edges as it stood baked every block active at that moment into the map's file for good: doorways bots got stuck
+    // in became walls, and rooms / whole quarters were cut off (Seine Crossing, 2026-10-14).
+    size_t n = (size_t)g->w * g->h * L;
+    unsigned char *edges = HeapAlloc(GetProcessHeap(), 0, n);
+    if (!edges) return 0;
+    memcpy(edges, g->edges, n);
+    blocks_restore_into(g, edges);
     FILE *f = fopen(path, "wb");
-    if (!f) return 0;
+    if (!f) { HeapFree(GetProcessHeap(), 0, edges); return 0; }
     NavFileHeader hd = {NAV_FILE_MAGIC, {0}, g->x0, g->z0, g->cell, g->w, g->h, L};
     memcpy(hd.level, g->level, sizeof hd.level);
-    size_t n = (size_t)g->w * g->h * L;
     int ok = fwrite(&hd, sizeof hd, 1, f) == 1 && fwrite(g->height, sizeof(float), n, f) == n &&
-             fwrite(g->flags, 1, n, f) == n && fwrite(g->edges, 1, n, f) == n && fwrite(g->fences, 1, n, f) == n;
+             fwrite(g->flags, 1, n, f) == n && fwrite(edges, 1, n, f) == n && fwrite(g->fences, 1, n, f) == n;
     fclose(f);
+    HeapFree(GetProcessHeap(), 0, edges);
     return ok;
 }
 
@@ -551,6 +560,15 @@ static int block_ok(const NavGrid *g, int k)
     int n = g->w * g->h * L;
     return g_blocks[k].g == g && g_blocks[k].w == g->w && g_blocks[k].h == g->h && g_blocks[k].node >= 0 && g_blocks[k].node < n &&
            g_blocks[k].nb >= 0 && g_blocks[k].nb < n;
+}
+// The links the active temporary blocks took out, put back into a copy of the link array (for saving).
+static void blocks_restore_into(const NavGrid *g, unsigned char *edges)
+{
+    for (int k = 0; k < MAX_NAV_BLOCKS; k++) {
+        if (!g_blocks[k].g || g_blocks[k].g != g || !block_ok(g, k)) continue;
+        edges[g_blocks[k].node] |= (unsigned char)(1 << g_blocks[k].d);
+        edges[g_blocks[k].nb] |= (unsigned char)(1 << ((g_blocks[k].d + 4) & 7));
+    }
 }
 int nav_unblock_expired(NavGrid *g, int all)
 {

@@ -2430,6 +2430,31 @@ static char *g_testVictim;
 static unsigned char g_brainHeld[MAX_BOTS];
 static unsigned g_vehChanceUntil[MAX_BOTS];   // just got out / just took a flag: may grab a ground vehicle nearby
 static void start_fight(int i, char *target, int retreat, const char *why);
+// ---- Objective first (the user, 2026-10-14): taking flags weighs more than kills. Close enemies and anyone shooting at a
+// bot from close in are still dealt with at once, but a bot on its way to a flag does not stop for a far-off fight, and a
+// bot that has been fighting in the same spot for a long time (a "Gettysburg" stalemate) breaks it off: it flanks round
+// the fight (higher ground and a covered spot preferred) or pushes straight for its flag, ignoring all but close enemies
+// for a while. ----
+#define STALL_RADIUS           25.0f       // m: still "the same spot"
+#define STALL_LIMIT_FRAMES     (40 * 30)   // fighting this long in the same spot without getting anywhere: break it
+#define STALL_RECENT_FRAMES    (6 * 30)    // fought / was hit this recently: counts as fighting
+#define PUSH_FRAMES            (30 * 30)   // after breaking a stalemate: only close enemies stop it for this long
+#define PUSH_ENGAGE_RANGE      25.0f
+#define PUSH_RETURN_FIRE_RANGE 40.0f       // ...and a shooter closer than this
+#define FLANK_FRAMES           (25 * 30)   // to reach the flanking spot
+#define ENROUTE_ENGAGE_RANGE   35.0f       // on the way to its flag: stops for enemies closer than this...
+#define ENROUTE_INWAY_COS      0.7f        // ...or ones in its way (within ~45 deg of the way there, not beyond the flag)
+static float g_stallAnchor[MAX_BOTS][3], g_flankGoal[MAX_BOTS][3];
+static unsigned char g_stallSet[MAX_BOTS];
+static unsigned g_stallEngaged[MAX_BOTS], g_lastEngagedAt[MAX_BOTS], g_pushUntil[MAX_BOTS], g_flankUntil[MAX_BOTS];
+static int g_stallCount[MAX_BOTS];
+static void stall_tick(int i, BotBrain *b, char *soldier);
+static unsigned char g_winPhase[MAX_BOTS];   // getting out of a closed-off room through a window (0 = not)
+static int window_escape_start(int i, char *soldier);
+static int g_winDebug;
+static int *g_landLabels;   // (defined with the boats: region of every dry nav node)
+static const unsigned char *boat_mask(void);   // (builds g_landLabels for the current grid)
+static void window_tick(int i, BotBrain *b, char *soldier);
 static int g_rocketsThisLife[MAX_BOTS];
 // Enemy ground vehicles near a bot without a launcher: over VEH_SLOW_SPEED it takes cover; at or under it, within throwing
 // range and with a grenade, it throws one first. Cover lasts until the vehicle is gone / empty / beyond VEH_THREAT_RANGE /
@@ -2529,6 +2554,7 @@ static void brain_tick(int i)
             b->targetFlag = -1;
             b->enroute = b->waiting = 0;
             b->task = TASK_NONE;   // dying releases any human order: back to the flag loop after respawn
+            g_winPhase[i] = 0; g_flankUntil[i] = 0;
             b->crouched = 0;       // a respawned soldier stands
             b->commander = b->serviceTarget = b->prevCommander = NULL;
             b->prevTask = TASK_NONE;
@@ -2579,6 +2605,7 @@ static void brain_tick(int i)
     cover_react(i, soldier);
     if (H->frame % 15 == (unsigned)(i % 15)) { rocket_scan(i, soldier); vehicle_threat_scan(i, soldier); repair_scan(i, soldier); revive_scan(i, soldier); }
     if (H->frame % 30 == (unsigned)(i % 30)) self_requests(i, soldier);
+    stall_tick(i, b, soldier);
     {
         int l, s;
         if (soldier_ammo2(soldier, 0, &l, &s) && s > g_spareMax[i]) g_spareMax[i] = s;
@@ -2600,6 +2627,17 @@ static void brain_tick(int i)
     if (wasRiding[i]) {   // just got out: plan again from here (a follower keeps following - handled by its task)
         wasRiding[i] = 0;
         if (b->task == TASK_NONE) choose_local_objective(i, "got out of a vehicle");
+    }
+    if (g_winPhase[i]) { window_tick(i, b, soldier); return; }   // climbing out of a closed-off room
+    if (g_flankUntil[i]) {   // on a flanking leg (stalemate breaker): get there, then on to the objective
+        float *me = (float *)(soldier + OFF_SOLDIER_POSITION);
+        int there = dist2(me, g_flankGoal[i]) < 4.0f * 4.0f || bot_nav(i)->mode == 1 || bot_nav(i)->mode == 0;
+        if (b->task != TASK_NONE || there || H->frame > g_flankUntil[i]) {
+            bot_log("brain: %s %s its flanking spot - on to the objective", name, there ? "reached" : b->task != TASK_NONE ? "was stopped short of" : "gave up on");
+            g_flankUntil[i] = 0;
+            b->enroute = b->waiting = 0;
+            b->targetFlag = -1;
+        } else return;
     }
     if (!g_flagCount) return;
     int team = player_team(pl), squad = player_squad(pl);
@@ -2663,6 +2701,14 @@ static void brain_tick(int i)
             if (deferred && !b->enroute) { b->targetFlag = -1; b->retryAt = H->frame + 3; return; }   // out of planning time: next tick
             if (b->enroute) g_noRouteSince[i] = 0;
             else if (!g_noRouteSince[i]) g_noRouteSince[i] = H->frame ? H->frame : 1;
+            else if (H->frame - g_noRouteSince[i] > 3 * 30 && !b->task && window_escape_start(i, soldier)) {   // a closed-off room:
+                g_noRouteSince[i] = 0;                                                                            // out through a window
+                return;
+            }
+            else if (H->frame - g_noRouteSince[i] > 15 * 30 && !b->task && (g_winDebug = 1, window_escape_start(i, soldier) ? (g_winDebug = 0, 1) : (g_winDebug = 0, 0))) {
+                g_noRouteSince[i] = 0;   // (the last window search, logged: why there is no way out)
+                return;
+            }
             else if (H->frame - g_noRouteSince[i] > 15 * 30) {   // no way to any flag for 15 s: trapped (a pocket the nav has no
                 g_noRouteSince[i] = 0;                            // way out of - e.g. dropped onto Seine's lower quay): redeploy
                 bot_log("brain: %s is trapped at (%.0f, %.1f, %.0f) - no route to any flag for 15 s, redeploying", name, pos[0], pos[1], pos[2]);
@@ -3073,6 +3119,176 @@ static void go_towards(int i, char *soldier, float x, float y, float z)
     bot_nav(i)->z = z;
 }
 
+// ---- Windows (the user, 2026-10-14): some spawn points put bots in rooms whose doors the nav grid has no way through
+// (Seine Crossing's flag 3 buildings) - but their windows can be knifed out, like a player would. A bot with no route
+// anywhere looks round the room at chest height for window glass (or a broken window: an opening over a sill), finds the
+// pane's edges with rays (left / right, then sill / top), stands 0.7 m in front of its centre, knifes it and jumps
+// through - if there is walkable ground right outside. Then its normal routing takes over. ----
+typedef struct WindowKind { unsigned material; const char *name; } WindowKind;
+static const WindowKind kWindows[] = {
+    {0x0900302b, "window glass"},   // MP_011 (Seine): 1.8 m wide panes from 0.8 m up over a 0.0144e wall (winlook, 2026-10-14)
+};
+static int window_material(unsigned m)
+{
+    for (unsigned k = 0; k < sizeof kWindows / sizeof kWindows[0]; k++) if (m == kWindows[k].material) return 1;
+    return 0;
+}
+static float g_winCentre[MAX_BOTS][3], g_winDir[MAX_BOTS][2], g_winStand[MAX_BOTS][3], g_winOut[MAX_BOTS][3];   // (g_winOut: the walkable spot outside)
+static unsigned g_winAt[MAX_BOTS];
+// What a horizontal ray along (dx, dz) from p at height y meets within reach: 2 glass, 1 open (nothing within reach), 0 a wall
+static int window_cell(const float *p, float y, float dx, float dz, float reach, float *dist)
+{
+    float a[3] = {p[0], y, p[2]}, b[3] = {p[0] + dx * reach, y, p[2] + dz * reach}, h[3];
+    unsigned saved = g_rayFlags;
+    g_rayFlags = 0x20;   // (soldiers do not count)
+    int r = ray_cast(a, b, h, NULL);
+    g_rayFlags = saved;
+    if (dist) *dist = r ? sqrtf((h[0] - a[0]) * (h[0] - a[0]) + (h[2] - a[2]) * (h[2] - a[2])) : reach;
+    if (!r) return 1;
+    return window_material(hit_material()) ? 2 : 0;
+}
+// (g_winDebug - console "windebug <bot>", and the last search before a trapped bot redeploys: why each direction is or is not a way out)
+static int window_escape_start(int i, char *soldier)
+{
+    NavGrid *g = *nav_slot();
+    if (!g || g->phase != 2) return 0;
+    float *me = (float *)(soldier + OFF_SOLDIER_POSITION), floorY = me[1];
+    float best = 1e9f, bc[3] = {0, 0, 0}, bd[2] = {0, 0}, bs[3] = {0, 0, 0}, bo[3] = {0, 0, 0}, bw = 0, bsill = 0;
+    struct { float d, c[3], dir[2], s[3], o[3], w, sill; } cand[32];
+    int nc = 0;
+    boat_mask();   // (the region labels: built once per grid, also after a core reload)
+    for (int a = 0; a < 32; a++) {
+        float ang = a * 0.19634954f, dx = sinf(ang), dz = cosf(ang), dWall, dChest;
+        int chest = window_cell(me, floorY + 1.3f, dx, dz, 8.0f, &dChest);
+        int knee = window_cell(me, floorY + 0.4f, dx, dz, 8.0f, &dWall);
+        if (g_winDebug) bot_log("windebug: %3.0f deg knee %s %.1f m, chest %s %.1f m", ang * 57.29578f, knee == 2 ? "glass" : knee == 1 ? "open" : "wall", dWall, chest == 2 ? "glass" : chest == 1 ? "open" : "wall", dChest);
+        if (knee != 0 || dWall > 7.5f) continue;                            // no sill / wall low down there
+        if (!(chest == 2 && fabsf(dChest - dWall) < 0.6f) && !(chest == 1 || dChest > dWall + 1.0f)) continue;   // glass over the sill, or open
+        // the pane: along the wall (t = right of the ray) from the hit point, at chest height
+        float hp[3] = {me[0] + dx * dWall, floorY, me[2] + dz * dWall}, tx = dz, tz = -dx;
+        float back[3] = {hp[0] - dx * 0.5f, 0, hp[2] - dz * 0.5f};
+        float lo = 0, hi = 0;
+        for (float s = 0.1f; s <= 1.6f; s += 0.1f) { float q[3] = {back[0] + tx * s, 0, back[2] + tz * s}; if (window_cell(q, floorY + 1.3f, dx, dz, 1.2f, NULL) == 0) break; hi = s; }
+        for (float s = -0.1f; s >= -1.6f; s -= 0.1f) { float q[3] = {back[0] + tx * s, 0, back[2] + tz * s}; if (window_cell(q, floorY + 1.3f, dx, dz, 1.2f, NULL) == 0) break; lo = s; }
+        float width = hi - lo + 0.1f;
+        if (g_winDebug) bot_log("windebug:     pane %.1f m wide", width);
+        if (width < 0.6f) continue;   // too narrow for a soldier
+        float mid = (hi + lo) * 0.5f, cq[3] = {back[0] + tx * mid, 0, back[2] + tz * mid};
+        float sill = 1.3f, top = 1.3f;   // sill / top: the lowest / highest height that is still glass or open
+        for (float y = 1.2f; y >= 0.2f; y -= 0.1f) { if (window_cell(cq, floorY + y, dx, dz, 1.2f, NULL) == 0) break; sill = y; }
+        for (float y = 1.4f; y <= 2.6f; y += 0.1f) { if (window_cell(cq, floorY + y, dx, dz, 1.2f, NULL) == 0) break; top = y; }
+        if (g_winDebug) bot_log("windebug:     sill %.1f top %.1f", sill, top);
+        if (sill > 1.3f || top - sill < 0.9f) continue;   // too high to vault / too low to get through
+        // walkable ground right outside (the nav grid has a node there, near our floor)
+        float out[3] = {hp[0] + tx * mid + dx * 1.2f, floorY, hp[2] + tz * mid + dz * 1.2f}, sn[3];
+        int snapOk = nav_snap(g, out[0], floorY + 0.5f, out[2], sn);
+        if (g_winDebug) bot_log("windebug:     outside (%.1f, %.1f): %s", out[0], out[2], !snapOk ? "no nav node" : fabsf(sn[1] - floorY) > 2.5f ? "node at another height" : sqrtf(dist2(sn, out)) > 2.0f ? "nearest node too far" : "ok");
+        if (!snapOk || fabsf(sn[1] - floorY) > 2.5f || sqrtf(dist2(sn, out)) > 2.0f) continue;
+        if (nc < 32) {   // a candidate (sorted and checked below)
+            cand[nc].d = dWall;
+            cand[nc].c[0] = hp[0] + tx * mid; cand[nc].c[1] = floorY + (sill + fminf(top, sill + 1.4f)) * 0.5f; cand[nc].c[2] = hp[2] + tz * mid;
+            cand[nc].dir[0] = dx; cand[nc].dir[1] = dz;
+            cand[nc].s[0] = cand[nc].c[0] - dx * 0.7f; cand[nc].s[1] = floorY; cand[nc].s[2] = cand[nc].c[2] - dz * 0.7f;
+            memcpy(cand[nc].o, sn, 12);
+            cand[nc].w = width; cand[nc].sill = sill;
+            nc++;
+        }
+    }
+    // nearest first; the first whose outside really leads somewhere - a route from there to the nearest flag (a window
+    // into a walled yard sent a bot back and forth through the same window, 2026-10-14). At most 3 route checks.
+    for (int tries = 0; tries < (g_landLabels ? 32 : 3) && nc > 0; tries++) {   // (labels are cheap: check them all)
+        int k = 0;
+        for (int q = 1; q < nc; q++) if (cand[q].d < cand[k].d) k = q;
+        int ok;
+        if (g_landLabels) {   // cheap: the region labels (flood fill along the nav links) - outside must be another region than
+                              // the room, and the region of a flag (a route search here never got planning time: the trapped
+                              // bot spends it on its failing flag routes every tick)
+            int lo = nav_label_at(g, g_landLabels, cand[k].o[0], cand[k].o[1], cand[k].o[2]), lr = nav_label_at(g, g_landLabels, me[0], me[1], me[2]);
+            ok = lo > 0 && lo != lr;
+            if (ok && g_flagCount) {
+                ok = 0;
+                for (int q = 0; q < g_flagCount && !ok; q++) {
+                    float fp3[3] = {flag_pos(q)[0], flag_pos(q)[1], flag_pos(q)[2]}, fs[3];
+                    if (nav_snap(g, fp3[0], fp3[1], fp3[2], fs) && nav_label_at(g, g_landLabels, fs[0], fs[1], fs[2]) == lo) ok = 1;
+                }
+            }
+            if (g_winDebug) bot_log("windebug:     window at (%.1f, %.1f): outside region %d, room region %d -> %s", cand[k].c[0], cand[k].c[2], lo, lr, ok ? "a way on" : "no way on");
+        } else {
+            if (!plan_budget_left()) { if (g_winDebug) bot_log("windebug: out of planning time this tick"); return 0; }
+            int f = -1;
+            float fd = 1e30f;
+            for (int q = 0; q < g_flagCount; q++) if (dist2(flag_pos(q), cand[k].o) < fd) { fd = dist2(flag_pos(q), cand[k].o); f = q; }
+            static float wpts[128 * 3];
+            ok = f < 0 || nav_find_path(g, ray_cast, cand[k].o[0], cand[k].o[1], cand[k].o[2], flag_pos(f)[0], flag_pos(f)[1], flag_pos(f)[2], wpts, 128) > 0;
+        }
+        if (ok) {
+            best = cand[k].d; memcpy(bc, cand[k].c, 12); bd[0] = cand[k].dir[0]; bd[1] = cand[k].dir[1];
+            memcpy(bs, cand[k].s, 12); memcpy(bo, cand[k].o, 12); bw = cand[k].w; bsill = cand[k].sill;
+            break;
+        }
+        if (g_winDebug) bot_log("window: %s skips the window at (%.1f, %.1f) - no way on from outside it", (char *)H->bots[i] + OFF_PLAYER_ONLINE_NAME, cand[k].c[0], cand[k].c[2]);
+        cand[k] = cand[--nc];
+    }
+    if (best > 1e8f) return 0;
+    memcpy(g_winCentre[i], bc, 12); g_winDir[i][0] = bd[0]; g_winDir[i][1] = bd[1]; memcpy(g_winStand[i], bs, 12); memcpy(g_winOut[i], bo, 12);
+    g_winPhase[i] = 1; g_winAt[i] = H->frame;
+    go_towards(i, soldier, bs[0], bs[1], bs[2]);
+    bot_log("window: %s is shut in at (%.1f, %.1f, %.1f) - out through a window %.1f m away (%.1f m wide, sill %.1f m) at (%.1f, %.1f)",
+            (char *)H->bots[i] + OFF_PLAYER_ONLINE_NAME, me[0], me[1], me[2], best, bw, bsill, bc[0], bc[2]);
+    return 1;
+}
+// phase 1: to the stand point; 2: knifing (held still by g_fenceUntil); 3: jumping through; then normal routing
+static void window_tick(int i, BotBrain *b, char *soldier)
+{
+    float *me = (float *)(soldier + OFF_SOLDIER_POSITION);
+    BotNav *nav = bot_nav(i);
+    const char *name = (char *)H->bots[i] + OFF_PLAYER_ONLINE_NAME;
+    float dx = g_winDir[i][0], dz = g_winDir[i][1];
+    // out = on the ground outside (near the walkable spot found there, at its height) - not up on the sill (14:03 a bot
+    // standing in the frame counted as out, found no route from there and started over)
+    float past = (me[0] - g_winCentre[i][0]) * dx + (me[2] - g_winCentre[i][2]) * dz;
+    int out = past > 0.5f && sqrtf(dist2(me, g_winOut[i])) < 1.5f && fabsf(me[1] - g_winOut[i][1]) < 0.6f;
+    if (b->task != TASK_NONE || H->frame - g_winAt[i] > 25 * 30 || out) {
+        bot_log("window: %s %s", name, out ? "is out through the window" : b->task != TASK_NONE ? "stops (busy)" : "gives up on the window");
+        g_winPhase[i] = 0;
+        b->enroute = b->waiting = 0; b->targetFlag = -1;
+        nav->mode = 0;
+        H->botMove[i][0] = H->botMove[i][1] = H->botMove[i][2] = 0;
+        return;
+    }
+    nav->targetYaw = yaw_towards(dx, dz);
+    if (g_winPhase[i] == 1) {
+        if (sqrtf(dist2(me, g_winStand[i])) < 0.6f || nav->mode == 1) {   // there: face it, knife the glass
+            g_winPhase[i] = 2;
+            nav->mode = 1;
+            unsigned f = H->frame;
+            g_aimPitch[i] = atan2f(g_winCentre[i][1] - (me[1] + 1.6f), 0.7f);
+            schedule_press(i, SLOT_ACTION(7), f + 8);   // knife out
+            schedule_press(i, EIA_FIRE_KNIFE, f + 30);
+            schedule_press(i, EIA_FIRE_KNIFE, f + 50);
+            schedule_press(i, EIA_FIRE_KNIFE, f + 70);
+            schedule_press(i, SLOT_ACTION(0), f + 95);  // rifle back out
+            g_fenceUntil[i] = f + 98; g_fenceAt[i] = f; g_fenceStrafe[i] = 0;   // (steer_bot holds still)
+            g_winAt[i] = H->frame;
+            bot_log("window: %s knifes the window at (%.1f, %.1f)", name, g_winCentre[i][0], g_winCentre[i][2]);
+        } else if (nav->mode == 0) go_towards(i, soldier, g_winStand[i][0], g_winStand[i][1], g_winStand[i][2]);
+        return;
+    }
+    if (g_winPhase[i] == 2) {
+        nav->mode = 1;
+        if (H->frame < g_fenceUntil[i]) return;
+        g_winPhase[i] = 3;   // through: run at a point beyond it and jump the sill
+        nav->mode = 4; nav->x = g_winOut[i][0] + dx * 1.5f; nav->z = g_winOut[i][2] + dz * 1.5f;
+        schedule_press(i, EIA_JUMP, H->frame + 4);
+        schedule_press(i, EIA_JUMP, H->frame + 22);
+        schedule_press(i, EIA_JUMP, H->frame + 45);
+        bot_log("window: %s jumps through", name);
+        return;
+    }
+    nav->mode = 4; nav->x = g_winOut[i][0] + dx * 1.5f; nav->z = g_winOut[i][2] + dz * 1.5f;   // phase 3
+    if (H->frame - g_winAt[i] > 5 * 30 && (H->frame - g_winAt[i]) % 45 == 0) schedule_press(i, EIA_JUMP, H->frame + 1);   // still inside: again
+}
+
 // Walks towards the human, stopping `standoff` metres short. Returns the current distance (1e30 if they have no soldier).
 static float approach(int i, BotBrain *b, char *soldier, char *human, float standoff)
 {
@@ -3480,6 +3696,10 @@ static void cover_react(int i, char *soldier)
                 return;
             }
         }
+    }
+    if (H->frame < g_pushUntil[i]) {   // pushing past a stalemate: only a close shooter stops it (it is spotted for the others)
+        char *ss = *(char **)(shooter + OFF_PLAYER_SOLDIER);
+        if (ss && hdist((float *)(soldier + OFF_SOLDIER_POSITION), (float *)(ss + OFF_SOLDIER_SPAWN_POSITION)) > PUSH_RETURN_FIRE_RANGE) return;
     }
     if (b->task == TASK_COVER) {
         if (b->step == 0) return;   // still running for it
@@ -5061,6 +5281,138 @@ static int spotted_cached(char *pl)
     return val[k];
 }
 
+// Whether a bot should take on an enemy soldier `d` metres off (see "Objective first" above).
+static int objective_allows_fight(int i, char *soldier, char *t, float d)
+{
+    if (H->frame < g_pushUntil[i]) return d < PUSH_ENGAGE_RANGE;
+    BotBrain *b = bot_brain(i);
+    if (b->task != TASK_NONE || !b->enroute || b->targetFlag < 0 || b->targetFlag >= g_flagCount) return 1;   // (holding / guarding / orders: as before)
+    if (d < ENROUTE_ENGAGE_RANGE) return 1;
+    char *ts = *(char **)(t + OFF_PLAYER_SOLDIER);
+    if (!ts) return 0;
+    float *me = (float *)(soldier + OFF_SOLDIER_POSITION), *tp = (float *)(ts + OFF_SOLDIER_SPAWN_POSITION), *fp = flag_pos(b->targetFlag);
+    float ex = tp[0] - me[0], ez = tp[2] - me[2], fx = fp[0] - me[0], fz = fp[2] - me[2];
+    float el = sqrtf(ex * ex + ez * ez) + 1e-3f, fl = sqrtf(fx * fx + fz * fz) + 1e-3f;
+    return (ex * fx + ez * fz) / (el * fl) > ENROUTE_INWAY_COS && el < fl + 20.0f;   // in the way, not beyond the flag
+}
+
+// A spot to the side of the fight to go round it: 30-60 m off the line to the enemy, a little forward; on the side of the
+// flag first, then higher ground and a spot hidden from the enemy. Plans the path (3 tries at most). 1 = on its way.
+static int flank_spot(int i, char *soldier, const float *me, const float *ep, int f, float *out)
+{
+    NavGrid *g = *nav_slot();
+    if (!g || g->phase != 2) return 0;
+    float ex = ep[0] - me[0], ez = ep[2] - me[2], el = sqrtf(ex * ex + ez * ez) + 1e-3f;
+    ex /= el; ez /= el;
+    float px = ez, pz = -ex;   // right of the line to the enemy
+    int pref = (i & 1) ? 1 : -1;
+    if (f >= 0) { float *fp = flag_pos(f); pref = (fp[0] - me[0]) * px + (fp[2] - me[2]) * pz >= 0 ? 1 : -1; }
+    if (g_stallCount[i] % 2 == 0) pref = -pref;   // the last flank did not work: the other side
+    float eeye[3] = {ep[0], ep[1] + 1.6f, ep[2]}, cand[12][3], score[12];
+    int n = 0;
+    for (int s = -1; s <= 1; s += 2)
+        for (int l = 0; l < 3; l++)
+            for (int k = 0; k < 2; k++) {
+                float lat = 30.0f + l * 15.0f, fwd = fminf(k ? 25.0f : 10.0f, el * 0.5f), pt[3];
+                if (!nav_snap(g, me[0] + px * s * lat + ex * fwd, me[1], me[2] + pz * s * lat + ez * fwd, pt) || fabsf(pt[1] - me[1]) > 6.0f) continue;   // (not an upper floor: stairs stop bots - 2026-10-14)
+                float body[3] = {pt[0], pt[1] + 1.0f, pt[2]};
+                float sc = (s == pref ? 10.0f : 0.0f) + fminf(8.0f, (pt[1] - me[1]) * 1.5f) + (solid_between(eeye, body, NULL) ? 15.0f : 0.0f);
+                if (f >= 0) sc -= sqrtf(dist2(pt, flag_pos(f))) * 0.05f;
+                memcpy(cand[n], pt, 12); score[n] = sc; n++;
+            }
+    for (int tries = 0; tries < 3 && n > 0; tries++) {
+        int bi = 0;
+        for (int k = 1; k < n; k++) if (score[k] > score[bi]) bi = k;
+        if (score[bi] < -1e8f || !plan_budget_left()) return 0;
+        if (plan_path(i, soldier, cand[bi][0], cand[bi][1], cand[bi][2])) {
+            memcpy(out, cand[bi], 12);
+            bot_nav(i)->mode = 3;
+            return 1;
+        }
+        score[bi] = -1e9f;
+    }
+    return 0;
+}
+
+static void break_stalemate(int i, BotBrain *b, char *soldier, int fromSquad)
+{
+    char *pl = H->bots[i], *name = pl + OFF_PLAYER_ONLINE_NAME;
+    float me[3];
+    memcpy(me, (float *)(soldier + OFF_SOLDIER_POSITION), 12);
+    float ep[3];
+    int known = 0;
+    char *e = g_fightTarget[i] ? g_fightTarget[i] : g_threat[i];
+    char *es = e && player_exists(e) ? *(char **)(e + OFF_PLAYER_SOLDIER) : NULL;
+    if (es) { memcpy(ep, (float *)(es + OFF_SOLDIER_SPAWN_POSITION), 12); known = 1; }
+    else if (g_fightLast[i][0] != 0 || g_fightLast[i][2] != 0) { memcpy(ep, g_fightLast[i], 12); known = 1; }
+    int team = player_team(pl), f = b->targetFlag;
+    if (f < 0 || f >= g_flagCount) f = g_flagCount ? pick_flag(team, me, -1) : -1;
+    // stop fighting / sheltering here (and no re-engaging the one it was stuck on)
+    if (b->task == TASK_FIGHT) end_fight(i, b, "stalemate - moving on");
+    else if (b->task == TASK_COVER) {
+        g_threat[i] = NULL; g_threatVeh[i] = NULL; g_coverProne[i] = g_coverOpen[i] = 0;
+        bot_stand(i);
+        end_task(i, b, "stalemate - moving on");
+    }
+    g_pushUntil[i] = H->frame + PUSH_FRAMES;
+    g_stallEngaged[i] = 0;
+    memcpy(g_stallAnchor[i], me, 12);
+    g_stallCount[i]++;
+    if (b->task != TASK_NONE) return;   // back to a human's order (defend / follow): that comes first
+    // flank when the enemy sits between it and the flag (or there is no flag), else straight for the objective; the next
+    // stall in a row tries the other
+    int flank = known;
+    if (f >= 0 && known) {
+        float *fp = flag_pos(f), fx = fp[0] - me[0], fz = fp[2] - me[2], ex = ep[0] - me[0], ez = ep[2] - me[2];
+        float fl = sqrtf(fx * fx + fz * fz) + 1e-3f, el = sqrtf(ex * ex + ez * ez) + 1e-3f;
+        flank = (fx * ex + fz * ez) / (fl * el) > 0.5f;   // within 60 deg of the way there
+        if (g_stallCount[i] % 2 == 0) flank = !flank;
+    }
+    float spot[3];
+    if (flank && known && flank_spot(i, soldier, me, ep, f, spot)) {
+        g_flankUntil[i] = H->frame + FLANK_FRAMES;
+        memcpy(g_flankGoal[i], spot, 12);
+        b->targetFlag = -1; b->enroute = b->waiting = 0;
+        bot_log("brain: %s has been fighting at (%.0f, %.0f) for %d s - flanks %.0f m %s to (%.0f, %.0f)%s, then on to flag %d", name, me[0], me[2],
+                STALL_LIMIT_FRAMES / 30, sqrtf(dist2(spot, me)), spot[1] - me[1] > 2.0f ? "up" : "round", spot[0], spot[2],
+                fromSquad ? " (with its squad)" : "", f);
+    } else {
+        b->targetFlag = -1; b->enroute = b->waiting = 0;
+        bot_nav(i)->mode = 0;
+        bot_log("brain: %s has been fighting at (%.0f, %.0f) for %d s - pushes on to %s%s", name, me[0], me[2], STALL_LIMIT_FRAMES / 30,
+                f >= 0 ? "its flag" : "somewhere else", fromSquad ? " (with its squad)" : "");
+    }
+    if (fromSquad) return;
+    int squad = player_squad(pl);   // squadmates stuck in the same fight go too
+    for (int j = 0; j < H->botCount && squad > 0; j++) {
+        char *jp = H->bots[j], *js = *(char **)(jp + OFF_PLAYER_SOLDIER);
+        BotBrain *o = bot_brain(j);
+        if (j == i || !js || !o->enabled || player_team(jp) != team || player_squad(jp) != squad || player_vehicle(jp)) continue;
+        if (o->task != TASK_NONE && o->task != TASK_FIGHT && o->task != TASK_COVER) continue;
+        if (dist2((float *)(js + OFF_SOLDIER_POSITION), me) > 30.0f * 30.0f || g_stallEngaged[j] < STALL_LIMIT_FRAMES / 3) continue;
+        break_stalemate(j, o, js, 1);
+    }
+}
+
+// Once a second: how long the bot has been fighting in the same spot (holding its flag does not count).
+static void stall_tick(int i, BotBrain *b, char *soldier)
+{
+    if ((H->frame + (unsigned)i) % 30) return;
+    float *me = (float *)(soldier + OFF_SOLDIER_POSITION);
+    int t = b->task;
+    if ((t != TASK_NONE && t != TASK_FIGHT && t != TASK_COVER) || g_flankUntil[i]) { g_stallSet[i] = 0; g_stallEngaged[i] = 0; return; }   // orders / supply / revive / flanking
+    if (t == TASK_FIGHT || t == TASK_COVER || H->frame - g_hitAt[i] < 5 * 30) g_lastEngagedAt[i] = H->frame;
+    if (!g_stallSet[i] || dist2(me, g_stallAnchor[i]) > STALL_RADIUS * STALL_RADIUS) {
+        memcpy(g_stallAnchor[i], me, 12); g_stallSet[i] = 1; g_stallEngaged[i] = 0;
+        return;
+    }
+    int f = b->targetFlag;
+    if (f >= 0 && f < g_flagCount && dist2(me, flag_pos(f)) < 30.0f * 30.0f) { g_stallEngaged[i] = 0; g_stallCount[i] = 0; return; }   // fighting on its flag is the job
+    if (H->frame - g_lastEngagedAt[i] < STALL_RECENT_FRAMES) g_stallEngaged[i] += 30;
+    else if (g_stallEngaged[i] >= 30) g_stallEngaged[i] -= 30;   // quiet: slowly forgets
+    if (g_stallEngaged[i] >= STALL_LIMIT_FRAMES && H->frame >= g_pushUntil[i]) break_stalemate(i, b, soldier, 0);
+}
+
 // "Enemy over there!": when a bot spots a soldier, teammate bots close enough to hear it that are not busy turn and
 // engage it from where they stand (no charging off); if they cannot see it they drop it after a few seconds.
 #define ALERT_RADIUS           30.0f
@@ -5081,6 +5433,7 @@ static void alert_nearby(char *spotter, char *target)
         float range = ENGAGE_RANGE * (is_recon(j) ? RECON_RANGE_FACTOR : 1.0f);
         if (dist2(op, tp) > range * range) continue;
         if (H->frame < g_engageCooldown[j] && g_cooldownWho[j] == target) continue;
+        if (!objective_allows_fight(j, os, target, sqrtf(dist2(op, tp)))) continue;   // on its way to a flag / pushing: keeps going
         {   // only a teammate that can see it from where it stands: the rest keep going (they used to all stop and face an
             // enemy only the spotter saw - a squad stood 30 m short of an enemy flag for minutes, fighting each new spawn)
             float eye[3] = {op[0], op[1] + 1.6f, op[2]}, chest[3] = {tp[0], tp[1] + 1.2f, tp[2]};
@@ -5129,6 +5482,7 @@ static void engage_seen(int i, char *t, char *veh, float d)
     int free = b->task == TASK_NONE || b->task == TASK_DEFEND || b->task == TASK_FOLLOW;
     if (!free && !(b->task == TASK_SUPPLY && d < 20.0f)) return;   // a supply run gives way to an enemy this close
     if (!is_spotted(t)) return;
+    if (!objective_allows_fight(i, soldier, t, d)) return;   // on its way to a flag / pushing: keeps going
     if (H->frame < g_engageCooldown[i] && (t == g_cooldownWho[i] || H->frame + ENGAGE_COOLDOWN_FRAMES - ENGAGE_BREATHER_FRAMES < g_engageCooldown[i])) return;
     if (b->task == TASK_SUPPLY) {
         bot_log("brain: %s drops its supply run - enemy %s at %.0f m", pl + OFF_PLAYER_ONLINE_NAME, t + OFF_PLAYER_ONLINE_NAME, d);
@@ -5160,10 +5514,84 @@ static void engage_seen(int i, char *t, char *veh, float d)
     }
 }
 
+// ---- AA Defense (the user, 2026-10-14): on a map with a stationary AA gun - the US Centurion C-RAM / the RU Pantsir-S1 -
+// each side that has one gets a hidden bot ("AA Defense US" / "AA Defense RU": an AI player, which clients leave off the
+// Tab list) that spawns, gets straight into its side's gun (seating works at any range) and shoots and spots enemy
+// aircraft only. No gun on the map (or none of that side's): no bot. Gun destroyed: it waits, dead, for it to come back. ----
+#define AA_RANGE        1200.0f
+static int is_aa_bot(int i) { return i >= 0 && i < H->botCount && !strncmp((char *)H->bots[i] + OFF_PLAYER_ONLINE_NAME, "AA Defense", 10); }
+static int vehicle_is_static_aa(char *v)
+{
+    const char *n0 = v ? vehicle_name(v) : NULL;
+    if (!n0) return 0;
+    char n[64];
+    int q = 0;
+    for (; n0[q] && q < 63; q++) n[q] = (char)toupper((unsigned char)n0[q]);
+    n[q] = 0;
+    return strstr(n, "CENTURION") || strstr(n, "CRAM") || strstr(n, "C-RAM") || strstr(n, "PHALANX") || strstr(n, "PANTSIR");
+}
+
+// Bots in vehicles spot too (the user, 2026-10-14: the "Q" spotting carried over to the Pilots): what the vehicle can see ahead
+// of it - a jet: aircraft out to 1500 m, ground vehicles to 800 m (soldiers are too small to pick out); a helicopter 800 m,
+// soldiers 200 m; tanks / IFVs: vehicles 400 m, aircraft 600 m, soldiers 150 m; anything else as on foot. Within 30 m all
+// round. Spotting only - the vehicle's own targeting does the shooting; a spotted soldier is still called out to the bots
+// on foot near it (bot_spot -> alert_nearby).
+static void vehicle_detect_tick(int i, char *veh)
+{
+    char *pl = H->bots[i], *pm = player_manager();
+    float *vm = vehicle_xf(veh);
+    if (!pm || !vm) return;
+    int vk = vehicle_kind(veh), air = vk == VK_JET || vk == VK_HELI, armour = vk == VK_TANK || vk == VK_IFV, aa = vehicle_is_static_aa(veh);
+    float rVeh = aa ? 0.0f : vk == VK_JET ? 800.0f : vk == VK_HELI ? 800.0f : armour ? 400.0f : DETECT_RANGE_VEHICLE;
+    float rAir = aa ? 1500.0f : vk == VK_JET ? 1500.0f : vk == VK_HELI ? 800.0f : armour ? 600.0f : DETECT_RANGE_VEHICLE;
+    float rInf = aa ? 0.0f : vk == VK_JET ? 0.0f : vk == VK_HELI ? 200.0f : armour ? 150.0f : DETECT_RANGE_INFANTRY;
+    float fx = vm[8], fz = vm[10], fl = sqrtf(fx * fx + fz * fz) + 1e-6f;
+    fx /= fl; fz /= fl;
+    float eye[3] = {vm[12], vm[13] + (air ? 0.0f : 2.5f), vm[14]};
+    void **arr = *(void ***)(pm + 0xac);
+    unsigned count = *(unsigned *)(pm + 8), bestK = 0;
+    char *best = NULL, *bestVeh = NULL;
+    float bestD = 1e30f;
+    for (unsigned k = 0; k < count && k < 64; k++) {
+        char *t = arr[k];
+        if (!t || t == pl || player_team(t) == player_team(pl)) continue;
+        char *ts = *(char **)(t + OFF_PLAYER_SOLDIER), *tv = player_vehicle(t);
+        if (!ts || *(float *)(ts + OFF_SOLDIER_HEALTH) <= 0) continue;
+        int tk = tv ? vehicle_kind(tv) : VK_OTHER;
+        float range = tv ? (tk == VK_JET || tk == VK_HELI ? rAir : rVeh) : rInf;
+        if (range <= 0) continue;
+        float *tp = (float *)(ts + OFF_SOLDIER_SPAWN_POSITION);   // (follows the seat in a vehicle)
+        float aim[3] = {tp[0], tp[1] + (tv ? 1.5f : 1.2f), tp[2]};
+        float dx = aim[0] - eye[0], dy = aim[1] - eye[1], dz = aim[2] - eye[2], d = sqrtf(dx * dx + dy * dy + dz * dz), hd = sqrtf(dx * dx + dz * dz) + 1e-6f;
+        if (d > range || d < 1.0f || d >= bestD) continue;
+        if (d > 30.0f && !aa && (dx * fx + dz * fz) / hd < DETECT_COS_HALF_FOV) continue;   // not in front of it (an AA turret: all round)
+        float off = air ? 12.0f : 6.0f, from[3] = {eye[0] + dx / d * off, eye[1] + dy / d * off, eye[2] + dz / d * off}, hit[3];   // from outside our own hull
+        if (d <= off + 2.0f) continue;
+        unsigned saved = g_rayFlags;
+        g_rayFlags = RAY_DONT_CHECK_CHARACTER;
+        int blocked = ray_cast(from, aim, hit, NULL);
+        g_rayFlags = saved;
+        if (blocked) {
+            float hx = hit[0] - aim[0], hy = hit[1] - aim[1], hz = hit[2] - aim[2];
+            if (!tv || hx * hx + hy * hy + hz * hz > (tk == VK_JET ? 12.0f : 5.0f) * (tk == VK_JET ? 12.0f : 5.0f)) continue;   // something else in the way
+        }
+        bestD = d; best = t; bestVeh = tv; bestK = k;
+    }
+    if (!best) return;
+    if (g_spottedWho[bestK] == best && H->frame - g_spottedAt[bestK] < SPOT_COOLDOWN_FRAMES) return;
+    if (bot_spot(pl, best)) {
+        g_spottedAt[bestK] = H->frame;
+        g_spottedWho[bestK] = best;
+        bot_log("detect: %s (in its %s) sees %s%s at %.0f m", pl + OFF_PLAYER_ONLINE_NAME, vehicle_name(veh), best + OFF_PLAYER_ONLINE_NAME,
+                bestVeh ? " (vehicle)" : "", bestD);
+    }
+}
+
 static void detect_tick(int i)
 {
     char *pl = H->bots[i], *s = *(char **)(pl + OFF_PLAYER_SOLDIER);
-    if (!s || player_vehicle(pl) || !bot_brain(i)->enabled) return;   // (brain off by hand: driven from the console)
+    if (s && player_vehicle(pl)) { vehicle_detect_tick(i, player_vehicle(pl)); return; }   // (a Pilot - or any bot riding)
+    if (!s || !bot_brain(i)->enabled) return;   // (brain off by hand: driven from the console)
     char *pm = player_manager();
     if (!pm) return;
     float *me = (float *)(s + OFF_SOLDIER_POSITION), yaw = *(float *)(s + OFF_SOLDIER_YAW);
@@ -6007,9 +6435,13 @@ static void level_tick(void)
         g_levelReady = 0;
         bot_log("level: round over - bots wait for the next level");
     }
-    int reloaded = !strcmp(lvl, g_level) && ((lastLvlObj && lvlObj != lastLvlObj) || loads != lastLoads ||
+    int objChanged = lastLvlObj && lvlObj != lastLvlObj;
+    int reloaded = !strcmp(lvl, g_level) && (objChanged || loads != lastLoads ||
                                             (roundOverAt && H->frame - roundOverAt > 180 * 30));
-    if (reloaded && changedAt && H->frame - changedAt < 45 * 30) reloaded = 0;   // (the change's own load event)
+    // (the change's own load event) - but never a new level object once the level was ready: its assets (the bots' kits)
+    // were looked up on the old one and are freed now (MP_013 -> MP_001 loaded twice 8 s apart: a kit from the first
+    // instance crashed server 1, 2026-10-14)
+    if (reloaded && changedAt && H->frame - changedAt < 45 * 30 && !(objChanged && g_levelReady)) reloaded = 0;
     if (loads != lastLoads || reloaded) roundOverAt = 0;
     lastLvlObj = lvlObj;
     lastLoads = loads;
@@ -6261,7 +6693,7 @@ static void cmd_spawn(const char *name)
         if (!H->teamBlueprint[team]) { bot_log("spawn: no SoldierBlueprint known for team %d yet (a human on that team must deploy once)", team); return; }
         ((SetPtr_t)ADDR_PLAYER_SET_BLUEPRINT)(bot, H->teamBlueprint[team]);
     }
-    int pilotBot = bot_index(bot) >= 0 && is_pilot(bot_index(bot));   // Pilots belong to no squad (the user, 2026-10-13)
+    int pilotBot = bot_index(bot) >= 0 && (is_pilot(bot_index(bot)) || is_aa_bot(bot_index(bot)));   // Pilots (and AA Defense) belong to no squad (the user, 2026-10-13)
     if (!pilotBot && player_squad(bot) == 0 && squad_join(bot, team)) return;   // joins a squad first; spawns on the next try
     if (pilotBot && player_squad(bot) > 0) {   // a Pilot still in one (from before): out of it while it is dead
         static unsigned outAt[MAX_BOTS];
@@ -7030,6 +7462,68 @@ __declspec(dllexport) void botmod_command(char *line)
         if (n) g_navDirty = 1;
         bot_log("navrepair: %d link(s) removed around (%.1f, %.1f), r %.0f m", n, x, z, r);
         nav_save_if_dirty();
+    } else if (!strncmp(line, "windebug ", 9)) {   // windebug <bot>: run the window search for it, logging every direction
+        char *pl = find_player(line + 9), *s = pl ? *(char **)(pl + OFF_PLAYER_SOLDIER) : NULL;
+        int k = pl ? bot_index(pl) : -1;
+        if (!s || k < 0) { bot_log("usage: windebug <bot on foot>"); return; }
+        g_winDebug = 1;
+        int r = window_escape_start(k, s);
+        g_winDebug = 0;
+        bot_log("windebug: %s -> %s", line + 9, r ? "a window (escape started)" : "no usable window");
+    } else if (!strncmp(line, "winlook ", 8)) {   // winlook <player>: a picture of what is in front of them - rays straight ahead
+        // (8 m) from a grid 3.2 m wide x 0.2-2.6 m up; each cell: the first hit's distance (0-9 m, '.' = nothing) and a letter per material
+        char *pl = find_player(line + 8), *s = pl ? *(char **)(pl + OFF_PLAYER_SOLDIER) : NULL;
+        if (!s) { bot_log("usage: winlook <player on foot>"); return; }
+        float *o = (float *)(s + OFF_SOLDIER_SPAWN_POSITION), yaw = *(float *)(s + OFF_SOLDIER_YAW);
+        float fx = sinf(yaw), fz = cosf(yaw), rx = fz, rz = -fx;
+        unsigned mats[16]; int nm = 0;
+        bot_log("winlook: %s at (%.1f, %.1f, %.1f) facing %.0f deg - rows top (2.6 m) to bottom (0.2 m), columns left to right (-1.6 .. +1.6 m)",
+                line + 8, o[0], o[1], o[2], yaw * 57.29578f);
+        for (int r = 12; r >= 0; r--) {
+            float hy = 0.2f + r * 0.2f;
+            char row[80]; int n = snprintf(row, sizeof row, "  %.1f m  ", hy);
+            for (int col = -8; col <= 8; col++) {
+                float lat = col * 0.2f, a3[3] = {o[0] + rx * lat, o[1] + hy, o[2] + rz * lat}, b3[3] = {a3[0] + fx * 8.0f, a3[1], a3[2] + fz * 8.0f}, h[3];
+                unsigned saved = g_rayFlags;
+                g_rayFlags = 0x20;
+                int hit = ray_cast(a3, b3, h, NULL);
+                g_rayFlags = saved;
+                if (!hit) { n += snprintf(row + n, sizeof row - n, " . "); continue; }
+                unsigned m = hit_material();
+                int k = 0;
+                while (k < nm && mats[k] != m) k++;
+                if (k == nm && nm < 16) mats[nm++] = m;
+                float d = sqrtf((h[0] - a3[0]) * (h[0] - a3[0]) + (h[2] - a3[2]) * (h[2] - a3[2]));
+                n += snprintf(row + n, sizeof row - n, "%c%d ", 'A' + k, d > 9.0f ? 9 : (int)d);
+            }
+            bot_log("%s", row);
+        }
+        char leg[300]; int n = 0;
+        for (int k = 0; k < nm; k++) n += snprintf(leg + n, sizeof leg - n, " %c=%08x", 'A' + k, mats[k]);
+        bot_log("winlook: materials%s", leg);
+    } else if (!strncmp(line, "winscan ", 8)) {   // winscan <x> <floorY> <z> | winscan <player>: rays all round at several heights (window research)
+        float o[3] = {0, 0, 0};
+        if (sscanf(line + 8, "%f %f %f", &o[0], &o[1], &o[2]) != 3) {
+            char *pl = find_player(line + 8), *s = pl ? *(char **)(pl + OFF_PLAYER_SOLDIER) : NULL;
+            if (!s) { bot_log("usage: winscan <x> <floorY> <z> | winscan <player>"); return; }
+            memcpy(o, (float *)(s + OFF_SOLDIER_POSITION), 12);
+        }
+        static const float hs[6] = {0.4f, 0.9f, 1.2f, 1.5f, 1.8f, 2.3f};
+        bot_log("winscan at (%.1f, %.1f, %.1f): per direction, distance@material at heights 0.4 0.9 1.2 1.5 1.8 2.3 m (- = nothing within 10 m)", o[0], o[1], o[2]);
+        for (int d = 0; d < 24; d++) {
+            float ang = d * 0.2617994f, sx = sinf(ang), sz = cosf(ang);
+            char ln[400]; int n = snprintf(ln, sizeof ln, "  %3d deg:", d * 15);
+            for (int k = 0; k < 6; k++) {
+                float a3[3] = {o[0], o[1] + hs[k], o[2]}, b3[3] = {o[0] + sx * 10.0f, o[1] + hs[k], o[2] + sz * 10.0f}, h[3];
+                unsigned saved = g_rayFlags;
+                g_rayFlags = 0x20;
+                int r = ray_cast(a3, b3, h, NULL);
+                g_rayFlags = saved;
+                if (r) n += snprintf(ln + n, sizeof ln - n, " %4.1f@%08x", sqrtf((h[0] - o[0]) * (h[0] - o[0]) + (h[2] - o[2]) * (h[2] - o[2])), hit_material());
+                else n += snprintf(ln + n, sizeof ln - n, "     -          ");
+            }
+            bot_log("%s", ln);
+        }
     } else if (!strncmp(line, "knife ", 6)) {   // knife <bot name>: the fence-cutting sequence, whatever is in front
         int i = bot_index(find_player(line + 6));
         char *s = i >= 0 ? *(char **)((char *)H->bots[i] + OFF_PLAYER_SOLDIER) : NULL;
@@ -7615,6 +8109,107 @@ static void roster_tick(void)
     }
 }
 
+// AA Defense lifetime (the user, 2026-10-14): no AA bot at all unless the map has that side's gun - it never holds a
+// player slot otherwise. A map change: out at once. On a map with the gun: in AA_JOIN_DELAY after the level is ready
+// (when the bots deploy), and only if its team has room: the roster's own bots for that team plus this one must still leave
+// the HUMAN_SLOTS_PER_TEAM slots free - checked every second, so it comes in as soon as there is. It is the first to go:
+// the moment its team is so full that a human slot is taken (a human joined), it leaves (before any roster bot does).
+// Its gun destroyed: it stays (dead) and gets back in when the gun respawns.
+#define AA_JOIN_DELAY_FRAMES (60 * 30)
+static void aa_tick(void)
+{
+    if (H->frame % 30 != 23) return;
+    static char aaLevel[64];
+    static unsigned readySince;
+    static unsigned char had[3];
+    const char *lvl = current_level();
+    int ready = level_ready();
+    if (!ready || !lvl || strcmp(aaLevel, lvl)) {   // loading / a new level: AA bots out, start over
+        for (int i = 0; i < H->botCount; i++)
+            if (is_aa_bot(i) && !removal_pending(H->bots[i])) {
+                bot_log("aa: %s leaves (%s)", (char *)H->bots[i] + OFF_PLAYER_ONLINE_NAME, ready ? "a new level" : "the level is changing");
+                queue_bot_removal(i);
+            }
+        readySince = 0;
+        had[1] = had[2] = 0;
+        if (ready && lvl) snprintf(aaLevel, sizeof aaLevel, "%s", lvl);
+        else aaLevel[0] = 0;
+        if (!ready) return;
+    }
+    if (!readySince) readySince = H->frame ? H->frame : 1;
+    char *gun[3] = {NULL, NULL, NULL}, **vehs;
+    int nv = vehicle_list(&vehs);
+    for (int k = 0; k < nv; k++) {   // each side's stationary AA gun: seen on this map at all / live now (seat free - or ours in it - first)
+        char *v = vehs[k];
+        if (IsBadReadPtr(v, 4) || *(unsigned *)v != ADDR_VEHICLE_VTABLE || !vehicle_is_static_aa(v)) continue;
+        int vt = 0;
+        if (!vehicle_pos(v, &vt)) continue;
+        if (vt != 1 && vt != 2) vt = vehicle_nation(v);
+        if (vt != 1 && vt != 2) continue;
+        had[vt] = 1;
+        if (!vehicle_ok(v)) continue;
+        char *occ = vehicle_occupant(v);
+        int usable = !occ || (bot_index(occ) >= 0 && is_aa_bot(bot_index(occ)));
+        if (!gun[vt] || usable) gun[vt] = v;
+    }
+    char *pm = player_manager();
+    int cap = team_capacity(), onTeam[3] = {0, 0, 0}, rTarget[3] = {0, 0, 0}, rHumans[3] = {0, 0, 0};
+    if (pm) {
+        void **arr = *(void ***)(pm + 0xac);
+        unsigned count = *(unsigned *)(pm + 8);
+        for (unsigned k = 0; k < count; k++) { int t = arr[k] ? player_team((char *)arr[k]) : 0; if (t == 1 || t == 2) onTeam[t]++; }
+    }
+    if (g_rosterAuto) roster_targets(rTarget, rHumans);   // (the roster's own plan for each team)
+    for (int team = 1; team <= 2; team++) {
+        const char *name = team == 1 ? "AA Defense US" : "AA Defense RU";
+        char *bot = find_player((char *)name);
+        int bi = bot ? bot_index(bot) : -1;
+        int limit = cap - HUMAN_SLOTS_PER_TEAM;   // players a team may have before a human slot is taken
+        if (bi >= 0 && !removal_pending(bot) && cap && (onTeam[team] > limit || (g_rosterAuto && rTarget[team] + rHumans[team] + 1 > limit))) {
+            bot_log("aa: %s leaves to make room (team %d: %d players, %d allowed before the human slots)", name, team, onTeam[team], limit);
+            queue_bot_removal(bi);
+            continue;
+        }
+        if (!had[team]) {   // this map has no gun of that side: no bot
+            if (bi >= 0 && !removal_pending(bot)) { bot_log("aa: no %s AA gun on %s - %s leaves", team == 1 ? "US" : "RU", lvl, name); queue_bot_removal(bi); }
+            continue;
+        }
+        if (!bot) {
+            if (!gun[team] || H->frame - readySince < AA_JOIN_DELAY_FRAMES || H->botCount >= MAX_BOTS || !pm) continue;
+            if (!cap || onTeam[team] + 1 > limit || (g_rosterAuto && rTarget[team] + rHumans[team] + 1 > limit)) {   // no room
+                static unsigned fullLogAt[3];
+                if (H->frame - fullLogAt[team] > 60 * 30) {
+                    fullLogAt[team] = H->frame;
+                    bot_log("aa: %s waits - no room on team %d (%d players now, the roster plans %d bots + %d humans, %d allowed before the human slots)",
+                            name, team, onTeam[team], rTarget[team], rHumans[team], limit);
+                }
+                continue;
+            }
+            cmd_add(name, team, 1);   // AI player: hidden from the Tab list
+            bot = find_player((char *)name);
+            bi = bot ? bot_index(bot) : -1;
+            if (bi >= 0) { set_brain(bi, 0); g_brainHeld[bi] = 1; }   // it never plays on foot (and the roster leaves it alone)
+            bot_log("aa: %s joins (hidden) for the %s on %s", name, vehicle_name(gun[team]), lvl);
+            continue;
+        }
+        if (bi < 0 || removal_pending(bot)) continue;
+        if (bot_brain(bi)->enabled) { set_brain(bi, 0); g_brainHeld[bi] = 1; }
+        char *veh = player_vehicle(bot);
+        if (veh && vehicle_is_static_aa(veh)) continue;   // manning it
+        if (!gun[team]) continue;                          // its gun is down: wait for it to respawn
+        if (!*(void **)(bot + OFF_PLAYER_SOLDIER)) { cmd_spawn(name); continue; }
+        if (veh) { g_pilotForceExit = 1; bot_exit_vehicle(bi, 0); g_pilotForceExit = 0; continue; }   // in something else: out first
+        int seat = driver_seat_free(gun[team]) ? 0 : free_seat(gun[team]);
+        if (seat < 0) continue;   // a human is on it
+        enter_vehicle(bot, gun[team], seat);
+        if (player_vehicle(bot) == gun[team]) {
+            bot_nav(bi)->mode = 0;
+            H->botMove[bi][0] = H->botMove[bi][1] = H->botMove[bi][2] = 0;
+            bot_log("aa: %s mans the %s (seat %d)", name, vehicle_name(gun[team]), seat);
+        }
+    }
+}
+
 // ---- Squads: bots fill bot-led squads (4 players); a bot that finds none creates the next free squad and leads it ----
 // Squad changes go through RCON admin.movePlayer (the engine's own squad logic), which only works while the bot is dead.
 #define OFF_PLAYER_SQUAD           0x784       // squad id (0 = none)
@@ -7999,6 +8594,34 @@ static void gunner_pick_target(int i, const float *gp)
 {
     char *pl = H->bots[i];
     int team = player_team(pl);
+    if (is_aa_bot(i)) {   // AA Defense: the nearest enemy aircraft in sight, nothing else
+        char **avs, *bv = NULL;
+        int nav = vehicle_list(&avs);
+        float bd = AA_RANGE;
+        for (int k = 0; k < nav; k++) {
+            char *v = avs[k];
+            int vteam = 0;
+            if (IsBadReadPtr(v, 4) || *(unsigned *)v != ADDR_VEHICLE_VTABLE || v == g_gunVeh[i]) continue;
+            int kd = vehicle_kind(v);
+            if (kd != VK_JET && kd != VK_HELI) continue;
+            float *tp = vehicle_pos(v, &vteam);
+            if (!tp || !vteam || vteam == team || *(float *)(v + OFF_VEHICLE_HEALTH) <= 0 || !vehicle_occupied(v)) continue;
+            float d = sqrtf(dist2(tp, gp) + (tp[1] - gp[1]) * (tp[1] - gp[1]));
+            float aim[3] = {tp[0], tp[1] + 1.0f, tp[2]};
+            if (d >= bd || !gun_can_see(gp, aim, 1)) continue;
+            bd = d; bv = v;
+        }
+        if (bv && bv != g_gunTargetVeh[i]) {
+            char *occ = vehicle_occupant(bv);
+            bot_log("aa: %s tracks %s's %s at %.0f m", pl + OFF_PLAYER_ONLINE_NAME, occ ? occ + OFF_PLAYER_ONLINE_NAME : "?", vehicle_name(bv), bd);
+            if (occ) bot_spot(pl, occ);
+            g_gunBurstAt[i] = H->frame;
+            g_gunLostAt[i] = 0;
+        }
+        g_gunTarget[i] = bv ? vehicle_occupant(bv) : NULL;
+        g_gunTargetVeh[i] = bv;
+        return;
+    }
     char *bestPl = NULL, *bestVeh = NULL;
     float bestD = GUN_VEHICLE_RANGE;
     char **vehs;
@@ -8078,7 +8701,7 @@ static void gunner_tick(int i)
     int seat = veh && !IsBadReadPtr(veh, 4) && *(unsigned *)veh == ADDR_VEHICLE_VTABLE ? vehicle_seat_of(veh, pl) : -1;
     // seat 0 too while the bot drives: a tank / IFV driver aims and fires the main gun (traverse / elevation / trigger are
     // separate inputs from steering); a jeep's driver seat has no weapon and the search gives up after a few tries
-    if (seat < 0 || (seat == 0 && !g_driving[i]) || !g_vehInput || g_flying[i]) { if (g_gunVeh[i]) gunner_reset(i); return; }
+    if (seat < 0 || (seat == 0 && !g_driving[i] && !is_aa_bot(i)) || !g_vehInput || g_flying[i]) { if (g_gunVeh[i]) gunner_reset(i); return; }
     if (veh != g_gunVeh[i]) { gunner_reset(i); g_gunVeh[i] = veh; g_gunStepAt[i] = H->frame + 30; memset(g_gunBad[i], 0, sizeof g_gunBad[i]); }
     float *vp = vehicle_pos(veh, NULL);
     if (!vp) return;
@@ -8163,13 +8786,14 @@ static void gunner_tick(int i)
     g_seatPitch[i] = perr > 0 ? pa : -pa;
     // a driver's main gun (one shell per reload): only when the line is within ~1.5 m of the aim point at that range,
     // trigger held while it is; gunner seats (machine guns) keep the wider window and their bursts
-    int mainGun = seat == 0 && !onCoax;
+    int aaGun = is_aa_bot(i), mainGun = seat == 0 && !onCoax && !aaGun;
     float tolY = mainGun ? fmaxf(0.006f, 1.0f / fmaxf(dh, 1.0f)) : 0.05f, tolP = mainGun ? fmaxf(0.008f, 1.0f / fmaxf(dh, 1.0f)) : 0.06f;
+    if (aaGun) tolY = tolP = fmaxf(0.012f, 8.0f / fmaxf(dh, 1.0f));   // an AA gun's stream: within ~8 m of the lead point, trigger held
     int onTarget = fabsf(err) < tolY && fabsf(perr) < tolP;
     g_gunAimErr[i] = fabsf(err) + fabsf(perr);
     g_gunTgtDist[i] = dh;
     unsigned ph = (H->frame - g_gunBurstAt[i]) % (GUN_BURST_ON + GUN_BURST_OFF);
-    g_gunFire[i] = (unsigned char)(onTarget && (mainGun || ph < GUN_BURST_ON) && H->frame - g_gunSwitchAt[i] > 15);   // (a switch takes a moment)
+    g_gunFire[i] = (unsigned char)(onTarget && (mainGun || aaGun || ph < GUN_BURST_ON) && H->frame - g_gunSwitchAt[i] > 15);   // (a switch takes a moment)
     if (g_gunDebug && H->frame % 30 == 0)
         bot_log("gunner: %s aim err yaw %.3f pitch %.3f (want %.3f have %.3f) dist %.0f fire %d levels %.2f %.2f | target v (%.1f, %.1f) m/s, lead %.1f m, holdover %.1f m",
                 pl + OFF_PLAYER_ONLINE_NAME, err, perr, atan2f(dy, dh), asinf(fmaxf(-1.0f, fminf(1.0f, f[1]))), dh, g_gunFire[i], g_seatYaw[i], g_seatPitch[i],
@@ -8495,7 +9119,7 @@ static const char *const kLightVehicles[] = {"Growler", "VDVBuggy", "Buggy", "DP
 static int vehicle_is_boat(char *veh) { return strstr(vehicle_name(veh), "RHIB") != NULL; }
 static unsigned char *g_boatMask;
 static unsigned g_boatMaskFor;   // grid serial
-static int *g_landLabels;   // landmass of every dry node (boat landings must be on the flag's)
+static int *g_landLabels;   // landmass of every dry node (boat landings must be on the flag's) - (also declared above)
 static const unsigned char *boat_mask(void)
 {
     NavGrid *g = *nav_slot();
@@ -8701,7 +9325,14 @@ static void taxi_masks(void)
 {
     NavGrid *g = *nav_slot();
     const unsigned char *dm = drive_mask();
-    if (!g || !dm) return;
+    if (!g || !dm) {   // no finished grid (a new level / a rebuild): masks of the old grid are dropped - never read against
+                       // another grid's nodes (server 1 crashed in the taxi route, 2026-10-14, building Caspian's grid)
+        if (g_taxiRoad && (!g || g_taxiFor != g->serial)) {
+            strike_forget(g_taxiRoad); HeapFree(GetProcessHeap(), 0, g_taxiRoad); g_taxiRoad = NULL;
+            if (g_taxiAny) { strike_forget(g_taxiAny); HeapFree(GetProcessHeap(), 0, g_taxiAny); g_taxiAny = NULL; }
+        }
+        return;
+    }
     int state = (g_paveCursor < 0) + 2 * (g_matDone && g_matFor == g->serial);
     if (g_taxiFor == g->serial && g_taxiRoad && g_taxiPaved == state) return;
     if (g_taxiRoad) { strike_forget(g_taxiRoad); HeapFree(GetProcessHeap(), 0, g_taxiRoad); }
@@ -8742,7 +9373,7 @@ static void roadwatch_tick(void)
     float a[3] = {hp[0], hp[1] + 1.5f, hp[2]}, b[3] = {hp[0], hp[1] - 3.0f, hp[2]}, h[3];
     if (ray_cast(a, b, h, NULL)) mat = hit_material();
     g_rayFlags = saved;
-    int dc = node >= 0 && dm ? dm[node] : 0, rc = node >= 0 && g_taxiRoad ? g_taxiRoad[node] : 0, ac = node >= 0 && g_taxiAny ? g_taxiAny[node] : 0;
+    int dc = node >= 0 && dm ? dm[node] : 0, rc = node >= 0 && g_taxiRoad && g_taxiFor == g->serial ? g_taxiRoad[node] : 0, ac = node >= 0 && g_taxiAny && g_taxiFor == g->serial ? g_taxiAny[node] : 0;
     const char *v = rc == 1 ? "STREET (middle)" : rc == 2 ? "STREET (near an edge)" : rc == 3 ? "STREET (against an edge)" : rc == 4 ? "OFF road" :
                     rc == 6 ? "OFF road (against an edge)" : dc ? "OFF road (by a tree)" : "not drivable";
     (void)ac;
@@ -9567,6 +10198,34 @@ static float air_leash(float *cx, float *cz)
 // A Pilot flying the flag circuit hunts (the user's order): enemy jets, then helicopters, then - with no flag left to
 // take - enemy ground vehicles (cannon strafing runs). Seek mode does the rest (seekers, cannon, ground runs); back to
 // the circuit when the target is down / out of its vehicle / far away.
+// Air Superiority with blimps still to take (the user, 2026-10-14: the blimps first, kills second): an enemy aircraft is only
+// worth going after when it is close (a threat right now), on our tail, or near the blimp we are working on. `slack` widens
+// the ranges for one already being hunted (so it is not dropped and picked up again every check).
+#define AIR_THREAT_CLOSE   600.0f
+#define AIR_TAIL_RANGE     1200.0f
+#define AIR_BLIMP_GUARD    800.0f
+static int air_blimps_left(int i)
+{
+    char gm[64];
+    chat_game_mode(gm, sizeof gm);
+    if (_strnicmp(gm, "AirSuperiority", 14)) return 0;
+    int team = player_team(H->bots[i]);
+    for (int f = 0; f < g_flagCount; f++) if (flag_owner(f) != team) return 1;
+    return 0;
+}
+static int air_target_worth(int i, const float *m, const float *tp, float slack)
+{
+    float d2 = dist2(tp, &m[12]), r;
+    r = AIR_THREAT_CLOSE * slack;
+    if (d2 < r * r) return 1;
+    float tx = tp[0] - m[12], tz = tp[2] - m[14], tl = sqrtf(tx * tx + tz * tz) + 1e-3f, fl = sqrtf(m[8] * m[8] + m[10] * m[10]) + 1e-3f;
+    r = AIR_TAIL_RANGE * slack;
+    if ((tx * m[8] + tz * m[10]) / (tl * fl) < -0.5f && d2 < r * r) return 1;   // behind us: on our tail
+    int f = g_flyFlag[i];
+    r = AIR_BLIMP_GUARD * slack;
+    if (f >= 0 && f < g_flagCount && dist2(tp, flag_pos(f)) < r * r) return 1;   // at the blimp we are taking
+    return 0;
+}
 static void pilot_air_tick(int i)
 {
     if (!is_pilot(i) || !g_flying[i] || !g_flyAuto[i] || g_flyTakeoff[i] || (H->frame + i * 11) % 60) return;
@@ -9579,7 +10238,12 @@ static void pilot_air_tick(int i)
         float *tm = tv ? vehicle_xf(tv) : NULL;
         float lcx, lcz, lr = air_leash(&lcx, &lcz);
         int outT = tm && lr > 0 && (tm[12] - lcx) * (tm[12] - lcx) + (tm[14] - lcz) * (tm[14] - lcz) > (lr + 200.0f) * (lr + 200.0f);
-        if (tm && !outT && dist2(&tm[12], &m[12]) < 3000.0f * 3000.0f) return;
+        if (tm && !outT && dist2(&tm[12], &m[12]) < 3000.0f * 3000.0f) {
+            if (!air_blimps_left(i) || air_target_worth(i, m, &tm[12], 1.5f)) return;
+            bot_log("air: %s leaves %s alone - back to the blimps", pl + OFF_PLAYER_ONLINE_NAME, t + OFF_PLAYER_ONLINE_NAME);
+            g_flyChase[i] = NULL; g_flySeek[i] = 0; g_flyCircuit[i] = 1; g_flyFlag[i] = -1;
+            return;
+        }
         if (outT) bot_log("air: %s lets %s go - past the map edge", pl + OFF_PLAYER_ONLINE_NAME, t + OFF_PLAYER_ONLINE_NAME);
         bot_log("air: %s breaks off %s (%s) - back to the flags", pl + OFF_PLAYER_ONLINE_NAME, t + OFF_PLAYER_ONLINE_NAME, tm ? "too far" : "gone");
         g_flyChase[i] = NULL; g_flySeek[i] = 0; g_flyCircuit[i] = 1; g_flyFlag[i] = -1;
@@ -9593,15 +10257,17 @@ static void pilot_air_tick(int i)
     unsigned count = pm ? *(unsigned *)(pm + 8) : 0;
     int bestRank = 99;
     float bestD = 2000.0f * 2000.0f;
+    char gmode[64];
+    chat_game_mode(gmode, sizeof gmode);
+    int blimps = toTake && !_strnicmp(gmode, "AirSuperiority", 14);   // blimps to take: aircraft only when they matter (air_target_worth)
     for (unsigned k = 0; arr && k < count && k < 64; k++) {
         char *p = arr[k], *pv;
         if (!p || p == pl || player_team(p) == team || !(pv = player_vehicle(p)) || !vehicle_ok(pv)) continue;
-        char gmode[64];
-        chat_game_mode(gmode, sizeof gmode);
         int kind = vehicle_kind(pv), rank = kind == VK_JET ? 0 : kind == VK_HELI ? 1 : (!toTake || _strnicmp(gmode, "AirSuperiority", 14) ? 2 : 99);   // ground: always, but in Air Superiority only once nothing is left to take
         if (rank == 99) continue;
         float *pm2 = vehicle_xf(pv);
         if (!pm2) continue;
+        if (blimps && !air_target_worth(i, m, &pm2[12], 1.0f)) continue;
         {   // not one out past the leash
             float lcx, lcz, lr = air_leash(&lcx, &lcz);
             if (lr > 0 && (pm2[12] - lcx) * (pm2[12] - lcx) + (pm2[14] - lcz) * (pm2[14] - lcz) > lr * lr) continue;
@@ -9868,6 +10534,11 @@ static void fly_tick(int i)
                 float tSpeed = sqrtf(g_flyTgtVel[i][0] * g_flyTgtVel[i][0] + g_flyTgtVel[i][1] * g_flyTgtVel[i][1] + g_flyTgtVel[i][2] * g_flyTgtVel[i][2]);
                 static unsigned char wasGround[MAX_BOTS];   // (25 / 40 m/s hysteresis: a jet taking off flipped cannon <-> seekers every tick)
                 int ground = wasGround[i] ? tSpeed < 40.0f : tSpeed < 25.0f;   // parked / taxiing / a ground vehicle: strafing runs instead of a dogfight (seekers too: they cannot lock it)
+                if (ground) {   // ...but a slow jet / helicopter still in the air (stalled, hovering) is not: no ground within 30 m under it
+                    int tk = vehicle_kind(tv);
+                    float gy;
+                    if ((tk == VK_JET || tk == VK_HELI) && !ground_below(tp[0], tp[2], tp[1] - 1.0f, tp[1] - 30.0f, &gy)) ground = 0;
+                }
                 wasGround[i] = (unsigned char)ground;
                 float hd = sqrtf(dx * dx + dz * dz);
                 if (!ground) g_strafeRun[i] = 0;
@@ -9901,10 +10572,16 @@ static void fly_tick(int i)
                     } else if ((aspect < 0.3f && dist > 800.0f) || dist > 1500.0f) {   // within 800 m: straight at it (the offset point kept it 17 deg off in a turning fight)   // (0.8 left it flying a parallel circle 660 m out, 35 deg off an orbiting target)
                          lp[0] = tp[0] - ux * 200.0f; lp[1] = tp[1] - uy * 200.0f; lp[2] = tp[2] - uz * 200.0f; }
                 }
-                if (g_flySeek[i] && !ground && dist < (seekGuns ? 60.0f : 110.0f)) {   // (guns want it close: 60 m)   // too close (it rammed the user, 2026-10-13): climb over it, no shots
-                    lp[0] = tp[0]; lp[1] = tp[1] + 150.0f; lp[2] = tp[2];
+                float closeV = ((g_flyVel[i][0] - g_flyTgtVel[i][0]) * dx + (g_flyVel[i][1] - g_flyTgtVel[i][1]) * dy + (g_flyVel[i][2] - g_flyTgtVel[i][2]) * dz) / (dist + 1e-3f);
+                if (g_flySeek[i] && !ground && dist < fmaxf(seekGuns ? 60.0f : 110.0f, closeV * 2.5f)) {   // (2.5 s before impact when closing fast)   // (guns want it close: 60 m)   // too close (it rammed the user, 2026-10-13): break off, no shots
+                    // Each breaks to its own right of the line between them (two jets doing this turn away from each other) and the
+                    // higher one climbs while the lower one dives a little: both "climbing over" the other at the same height met in
+                    // the middle - a mid-air between two bots on Wake, 2026-10-14. (A tie in height: the lower bot number climbs.)
+                    float hl = sqrtf(dx * dx + dz * dz) + 1e-3f, up = 120.0f;
+                    if (dy > 15.0f || (fabsf(dy) <= 15.0f && is_bot(g_flyChase[i]) && bot_index(g_flyChase[i]) >= 0 && bot_index(g_flyChase[i]) < i)) up = -60.0f;
+                    lp[0] = m[12] + dz / hl * 250.0f; lp[1] = m[13] + up; lp[2] = m[14] - dx / hl * 250.0f;
                     static unsigned overAt[MAX_BOTS];
-                    if (H->frame - overAt[i] > 90) { overAt[i] = H->frame; bot_log("seek: %s too close to %s (%.0f m) - climbs over it", pl + OFF_PLAYER_ONLINE_NAME, g_flyChase[i] + OFF_PLAYER_ONLINE_NAME, dist); }
+                    if (H->frame - overAt[i] > 90) { overAt[i] = H->frame; bot_log("seek: %s too close to %s (%.0f m) - breaks right and %s", pl + OFF_PLAYER_ONLINE_NAME, g_flyChase[i] + OFF_PLAYER_ONLINE_NAME, dist, up > 0 ? "up" : "down"); }
                 }
                 g_flyGoal[i][0] = lp[0]; g_flyGoal[i][1] = lp[2]; g_flyGoal[i][2] = lp[1];
                 if (ground && g_strafeRun[i] != 1) {   // out to 1.8 km from it - towards the middle of the flags (the far side of the
@@ -10019,6 +10696,21 @@ static void fly_tick(int i)
         float wantPitch = fmaxf(-15.0f, fminf(15.0f, (goalAlt - alt) * 0.15f));
         if (chasing) wantPitch = fmaxf(g_strafeRun[i] ? -45.0f : -35.0f, fminf(30.0f, chaseElev));
         if (evading) wantPitch = fmaxf(-10.0f, fminf(0.0f, wantPitch));   // no climbing in the break: keep the speed
+        {   // altitude cap (the user, 2026-10-14: dogfights kept spiralling up - a jet stalled out at 1270 m on Firestorm): no
+            // higher than AIR_CAP_ABOVE_FLAGS over the highest flag, nor 150 m under a ceiling found; 80 m under it no more
+            // climbing, over it nose down (in a turn that means more bank, not less)
+            #define AIR_CAP_ABOVE_FLAGS 500.0f
+            float top = -1e9f;
+            for (int k = 0; k < g_flagCount; k++) if (flag_pos(k)[1] > top) top = flag_pos(k)[1];
+            if (!g_flagCount) top = alt - g_flyAgl[i];
+            float cap = fminf(top + AIR_CAP_ABOVE_FLAGS, g_flyCeiling - 150.0f);
+            if (alt > cap - 80.0f) wantPitch = fminf(wantPitch, (cap - alt) * 0.15f);
+            if (alt > cap) {
+                wantPitch = fminf(wantPitch, -8.0f);
+                static unsigned capLogAt[MAX_BOTS];
+                if (H->frame - capLogAt[i] > 10 * 30) { capLogAt[i] = H->frame; bot_log("fly: %s is over the altitude cap (%.0f m > %.0f m) - comes down", pl + OFF_PLAYER_ONLINE_NAME, alt, cap); }
+            }
+        }
         float balloonSide = 0, balloonUp = 0;
         {   // a flag balloon on the flight path in the next 3 s, within 60 m: avoid it (it flew into one chasing)
             float fx = m[8], fy = m[9], fz = m[10], v = fmaxf(spd[i], 60.0f);
@@ -10120,7 +10812,9 @@ static void fly_tick(int i)
         if (evading) g_sprintUntil[i] = H->frame + 3;   // boost through the break too
         if (g_flySeek[i] && chasing && !evading && !danger && !slow && !g_flyDive[i] && !g_flyPull[i] && !g_strafeRun[i])   // seekers: sit 200-350 m behind it
             H->botMove[i][0] = 0 && g_seekTurnFight[i] && spd[i] > 70.0f ? 0.0f :   // (off: the user preferred it without - it fell off their tail)
-                               g_seekDist[i] > 350.0f ? 1.0f : g_seekDist[i] > 200.0f ? 0.4f : -1.0f;   // (120-250 m kept overrunning a human to 109 m)
+                               g_seekDist[i] > 350.0f ? 1.0f : g_seekDist[i] > 200.0f ? 0.4f :   // (120-250 m kept overrunning a human to 109 m)
+                               spd[i] > 110.0f && alt < g_flyCeiling - 250.0f ? -1.0f :            // the air brake only when fast and not high up (braking
+                               spd[i] < 95.0f ? 1.0f : 0.4f;                                       // through a close turning fight stalled a jet at 950 m, 2026-10-14)
         H->botMove[i][1] = 0;
         H->botMove[i][2] = rudder;
         if (fire && (!danger || g_flyDive[i])) press_button(i, EIA_FIRE, 2);
@@ -10474,13 +11168,91 @@ static void pilot_hold_tick(int i, DriveState *d)
     memcpy(d->start, vp, 12);
     bot_log("pilot: %s drives its %s to flag %d (%.0f m, owner %d)", pl + OFF_PLAYER_ONLINE_NAME, vehicle_name(veh), best, sqrtf(dist2(fp, vp)), flag_owner(best));
 }
+// Armour stalemates (the user, 2026-10-14): a Pilot's tank / IFV that has been trading fire around the same spot for 45 s
+// without getting to its flag drives round the fight - to a spot 60-120 m to the side of the way to the flag, on the side
+// the fire is not coming from, higher ground and a spot hidden from the enemy preferred - then on to the flag (the hold
+// logic re-plans from there). Failing a spot: straight for the flag. For a while after, it does not slow down to shoot.
+#define VSTALL_RADIUS        35.0f
+#define VSTALL_LIMIT_FRAMES  (45 * 30)
+#define VPUSH_FRAMES         (40 * 30)
+static float g_vStallAnchor[MAX_BOTS][3];
+static unsigned char g_vStallSet[MAX_BOTS];
+static unsigned g_vStallEngaged[MAX_BOTS], g_vLastEngagedAt[MAX_BOTS], g_vehPushUntil[MAX_BOTS];
+static int g_vStallCount[MAX_BOTS];
+static int vehicle_flank_spot(int i, const float *vp, int f, float *out)
+{
+    NavGrid *g = *nav_slot();
+    if (!g || g->phase != 2 || !g_driveMask || g_driveMaskFor != g->serial) return 0;
+    float *fp = flag_pos(f), fx = fp[0] - vp[0], fz = fp[2] - vp[2], fl = sqrtf(fx * fx + fz * fz) + 1e-3f;
+    fx /= fl; fz /= fl;
+    float ex = fx, ez = fz, er = 100.0f;   // where the fire comes from: the gun's last bearing, else ahead
+    if (H->frame - g_vLastEngagedAt[i] < 6 * 30) { ex = sinf(g_gunTgtBearing[i]); ez = cosf(g_gunTgtBearing[i]); er = fmaxf(60.0f, fminf(300.0f, g_gunTgtDist[i])); }
+    float px = fz, pz = -fx;   // right of the way to the flag
+    int away = (ex * px + ez * pz) > 0 ? -1 : 1;   // the side the fire is not coming from
+    if (g_vStallCount[i] % 2 == 0) away = -away;   // the last one did not work: the other side
+    float ep[3] = {vp[0] + ex * er, vp[1] + 2.5f, vp[2] + ez * er}, best[3] = {0, 0, 0}, bestSc = -1e9f, hit[3], nrm[3];
+    for (int s = -1; s <= 1; s += 2)
+        for (float lat = 60.0f; lat <= 120.0f; lat += 30.0f)
+            for (float fwd = 30.0f; fwd <= 90.0f; fwd += 30.0f) {
+                float c[3];
+                if (fwd > fl) continue;   // not past the flag
+                if (!nav_mask_nearest(g, g_driveMask, vp[0] + px * s * lat + fx * fwd, vp[2] + pz * s * lat + fz * fwd, 15.0f, c)) continue;
+                if (dist2(c, vp) < 40.0f * 40.0f) continue;
+                float eye[3] = {c[0], c[1] + 2.5f, c[2]};
+                float sc = (s == away ? 20.0f : 0.0f) + fminf(25.0f, c[1] - vp[1]) + (ray_cast(ep, eye, hit, nrm) ? 10.0f : 0.0f) - sqrtf(dist2(c, fp)) * 0.03f;
+                if (sc > bestSc) { bestSc = sc; memcpy(best, c, 12); }
+            }
+    if (bestSc < -1e8f) return 0;
+    memcpy(out, best, 12);
+    return 1;
+}
+static void vehicle_stall_tick(int i, DriveState *d)
+{
+    if ((H->frame + (unsigned)i) % 30) return;
+    char *pl = H->bots[i], *veh = player_vehicle(pl);
+    int vk = veh ? vehicle_kind(veh) : VK_OTHER;
+    if (!veh || (vk != VK_TANK && vk != VK_IFV) || g_flying[i] || !vehicle_ok(veh)) { g_vStallSet[i] = 0; return; }
+    float *vp = vehicle_pos(veh, NULL);
+    if (!vp) return;
+    if (g_gunTarget[i] || g_gunTargetVeh[i]) g_vLastEngagedAt[i] = H->frame;
+    if (!g_vStallSet[i] || dist2(vp, g_vStallAnchor[i]) > VSTALL_RADIUS * VSTALL_RADIUS) {
+        memcpy(g_vStallAnchor[i], vp, 12); g_vStallSet[i] = 1; g_vStallEngaged[i] = 0;
+        return;
+    }
+    int team = player_team(pl), f = -1;
+    float bd = 1e30f;
+    for (int k = 0; k < g_flagCount; k++) if (flag_owner(k) != team && dist2(flag_pos(k), vp) < bd) { bd = dist2(flag_pos(k), vp); f = k; }
+    if (f < 0) { g_vStallEngaged[i] = 0; return; }   // all ours: guarding the front is the job
+    if (bd < (PILOT_STOP_SHORT + 25.0f) * (PILOT_STOP_SHORT + 25.0f)) { g_vStallEngaged[i] = 0; g_vStallCount[i] = 0; return; }   // on the flag: taking it
+    if (H->frame - g_vLastEngagedAt[i] < 6 * 30) g_vStallEngaged[i] += 30;
+    else if (g_vStallEngaged[i] >= 30) g_vStallEngaged[i] -= 30;
+    if (g_vStallEngaged[i] < VSTALL_LIMIT_FRAMES || H->frame < g_vehPushUntil[i]) return;
+    g_vStallEngaged[i] = 0;
+    g_vStallCount[i]++;
+    memcpy(g_vStallAnchor[i], vp, 12);
+    float goal[3];
+    int flank = vehicle_flank_spot(i, vp, f, goal);
+    if (!flank) memcpy(goal, flag_pos(f), 12);
+    float spd = d->speed;
+    memset(d, 0, sizeof *d);
+    d->veh = veh; d->phase = 2; d->at = H->frame; d->flag = flank ? -1 : f; d->speed = spd; d->manual = 1;
+    memcpy(d->goal, goal, 12);
+    memcpy(d->start, vp, 12);
+    g_driving[i] = 1;
+    g_vehPushUntil[i] = H->frame + VPUSH_FRAMES;
+    if (flank) bot_log("pilot: %s's %s has been trading fire at (%.0f, %.0f) for %d s - drives round it to (%.0f, %.0f), %.0f m %s, then on to flag %d",
+                       pl + OFF_PLAYER_ONLINE_NAME, vehicle_name(veh), vp[0], vp[2], VSTALL_LIMIT_FRAMES / 30, goal[0], goal[2], fabsf(goal[1] - vp[1]),
+                       goal[1] > vp[1] ? "higher" : "lower", f);
+    else bot_log("pilot: %s's %s has been trading fire at (%.0f, %.0f) for %d s - no way round, pushes straight for flag %d",
+                 pl + OFF_PLAYER_ONLINE_NAME, vehicle_name(veh), vp[0], vp[2], VSTALL_LIMIT_FRAMES / 30, f);
+}
 static void drive_tick(int i)
 {
     DriveState *d = &g_drive[i];
     char *pl = H->bots[i], *s = *(char **)(pl + OFF_PLAYER_SOLDIER);
     if (!d->phase) return;
     if (!s || (!d->manual && !bot_brain(i)->enabled)) { drive_stop(i, "stops driving (dead / switched off)", 10); return; }
-    if (is_pilot(i)) pilot_repair_tick(i, player_vehicle(pl));
+    if (is_pilot(i)) { pilot_repair_tick(i, player_vehicle(pl)); vehicle_stall_tick(i, d); }
     if (d->phase == 8) { pilot_hold_tick(i, d); return; }
     if (!vehicle_ok(d->veh)) { drive_stop(i, "lost the vehicle (destroyed)", 20); return; }
     float *vp = vehicle_pos(d->veh, NULL);
@@ -10628,7 +11400,7 @@ static void drive_tick(int i)
     if (d->phase == 2 && d->taxi && !vehicle_is_boat(d->veh)) {   // a taxi: roads, 3 m clear - nothing else
         NavGrid *g = *nav_slot();
         taxi_masks();
-        if (!g || !g_taxiRoad) { vehicle_mark_bad(d->veh, 90); drive_stop(i, "has no road map", 60); return; }
+        if (!g || g->phase != 2 || !g_taxiRoad || g_taxiFor != g->serial) { vehicle_mark_bad(d->veh, 90); drive_stop(i, "has no road map", 60); return; }
         const char *which = "the roads";
         d->n = 0;
         // the road map; the same without its stuck-spot strikes (a few bumps at a narrow HQ exit sealed both of Seine's HQs);
@@ -10870,7 +11642,7 @@ static void drive_tick(int i)
         }
     }
     // a driver lining up its main gun on a target slows to a crawl - a rocking hull throws the shot off
-    if (g_driving[i] && g_gunWeapon[i] && (g_gunTarget[i] || g_gunTargetVeh[i]) && g_gunAimErr[i] < 0.25f && g_gunTgtDist[i] < 120.0f)
+    if (g_driving[i] && g_gunWeapon[i] && (g_gunTarget[i] || g_gunTargetVeh[i]) && g_gunAimErr[i] < 0.25f && g_gunTgtDist[i] < 120.0f && H->frame >= g_vehPushUntil[i])
         vwant = fminf(vwant, is_pilot(i) && d->flag >= 0 && flag_owner(d->flag) != player_team(pl) ? 8.0f : 3.0f);   // a Pilot taking a flag
         // shoots on the move (crawling at 3 m/s in every tank fight, it never got to the flag - the user, 2026-10-13)
     {   // bumper: anything ahead at 1 m up?
@@ -10978,7 +11750,7 @@ static void drive_tick(int i)
                 float ax = vp[0] + fx * 4.0f + rx * side * 1.5f, az = vp[2] + fz * 4.0f + rz * side * 1.5f;
                 int k = drive_strike(sm, ax, az, 3.0f);
                 if (tank_mask_now() && !vehicle_is_boat(d->veh)) k += drive_strike(g_tankMask, ax, az, 4.0f);   // (a pilot's route map too)
-                if (d->taxi) { k += drive_strike(g_taxiRoad, ax, az, 4.0f); k += drive_strike(g_taxiAny, ax, az, 4.0f); }
+                if (d->taxi && g_taxiFor == ((*nav_slot()) ? (*nav_slot())->serial : 0)) { k += drive_strike(g_taxiRoad, ax, az, 4.0f); k += drive_strike(g_taxiAny, ax, az, 4.0f); }
                 bot_log("drive: (%.0f, %.0f) struck off the drivable map (%d node(s)); %s re-routes round it", ax, az, k, pl + OFF_PLAYER_ONLINE_NAME);
                 d->phase = 2;
             }
@@ -11022,7 +11794,7 @@ static void drive_tick(int i)
                 float ax = vp[0] + xf[8] * 6.0f, az = vp[2] + xf[10] * 6.0f;   // ahead of it (its own spot stays drivable)
                 int k = drive_strike(sm, ax, az, 3.0f);
                 if (tank_mask_now() && !vehicle_is_boat(d->veh)) k += drive_strike(g_tankMask, ax, az, 4.0f);   // (a pilot's route map too)
-                if (d->taxi) { k += drive_strike(g_taxiRoad, ax, az, 5.0f); k += drive_strike(g_taxiAny, ax, az, 5.0f); }
+                if (d->taxi && g_taxiFor == ((*nav_slot()) ? (*nav_slot())->serial : 0)) { k += drive_strike(g_taxiRoad, ax, az, 5.0f); k += drive_strike(g_taxiAny, ax, az, 5.0f); }
                 if (k == 0) {   // already struck and still stuck there: what holds it is beside / under the front - wider
                     ax = vp[0] + xf[8] * 4.5f; az = vp[2] + xf[10] * 4.5f;
                     k = drive_strike(sm, ax, az, 5.0f);
@@ -11356,6 +12128,7 @@ __declspec(dllexport) void botmod_tick(void)
     }
     g_where = "roster/squads/downed/nav";
     roster_tick();
+    aa_tick();
     { double t = perf_now(); perf_add(PF_ROSTER, t - tMark); tMark = t; }
     squad_tick();
     { double t = perf_now(); perf_add(PF_SQUAD, t - tMark); tMark = t; }
