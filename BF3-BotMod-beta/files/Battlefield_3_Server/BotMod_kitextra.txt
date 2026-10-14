@@ -1,0 +1,19 @@
+# <class> <slot> <asset> - an item in a slot for every bot kit of that class (slot 1 = pistol)
+# <class|*> perk <asset>   - the kit's specialization (perk)
+# <class|*> unlock <asset> - one more unlock for the kit (vehicle unlocks: e.g. the jet flare launcher)
+Engineer 1 Weapons/Gadgets/M15/U_M15
+* perk Persistence/Unlocks/Soldiers/Specializations/AmmoBoostL1
+* unlock Persistence/Unlocks/Vehicles/JetFlareLauncher
+* unlock Persistence/Unlocks/Vehicles/JetHeatseekerStance
+* unlock Persistence/Unlocks/Vehicles/MbtSmokeLaunchers
+* unlock Persistence/Unlocks/Vehicles/IfvSmokeLaunchers
+* unlock Persistence/Unlocks/Vehicles/AavSmokeLaunchers
+* unlock Persistence/Unlocks/Vehicles/LbtSmokeLaunchers
+* unlock Persistence/Unlocks/Vehicles/LbtCoaxLMG
+* unlock Persistence/Unlocks/Vehicles/IfvCoax
+* unlock Persistence/Unlocks/Vehicles/IfvReloadUpgrade
+* unlock Persistence/Unlocks/Vehicles/MbtCoaxLMG
+* unlock Persistence/Unlocks/Vehicles/MbtReloadUpgrade1
+# <class|*> nounlock <asset>: drop an unlock a captured kit brought along (to match the user's own vehicle setups)
+* nounlock Persistence/Unlocks/Vehicles/IfvTOW
+* nounlock Persistence/Unlocks/Vehicles/MbtProximityScan

@@ -15,8 +15,12 @@ void chat_say(const char *fmt, ...);
 void chat_rcon(const char *fmt, ...);
 // The server's current player limit (vars.maxPlayers via RCON serverInfo, refreshed every 30 s); 0 = not known yet.
 int chat_max_players(void);
+// The server's game mode (serverInfo, e.g. ConquestLarge0, TankSuperiority0), read again after every level load; "" = not yet.
+void chat_game_mode(char *out, int n);
 // How many server.onLevelLoaded / server.onRoundOver events RCON has delivered so far (level reloads of the same map
 // are invisible otherwise).
 void chat_level_events(long *loads, long *roundsOver);
 // Switches the server to map `code` (e.g. MP_017) right away, via the rotation; announces it in chat.
 void chat_map(const char *code, const char *who);
+// Says this server's map rotation in chat (the !map list).
+void chat_map_list(void);

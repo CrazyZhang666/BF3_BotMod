@@ -40,6 +40,29 @@ static void read_command_line(void)
         if (*p == '"') { p++; const char *e = strchr(p, '"'); snprintf(g_password, sizeof g_password, "%.*s", e ? (int)(e - p) : 127, p); }
         else sscanf(p, "%127s", g_password);
     }
+    // The instance's Admin\Startup.txt runs after the command line: its admin.password is the one RCON really takes
+    // (server 2's command line said QNWSxJYl, its Startup.txt 8zrdbcGi - the login failed silently, so no level / round
+    // events reached BotMod, a round restart went unnoticed and a bot spawned with the old round's freed kit crashed it)
+    if ((p = strstr(cl, "-serverInstancePath ")) != NULL) {
+        char dir[MAX_PATH] = "", path[MAX_PATH + 32], line[256];
+        p += 20;
+        if (*p == '"') { p++; const char *e = strchr(p, '"'); snprintf(dir, sizeof dir, "%.*s", e ? (int)(e - p) : MAX_PATH - 1, p); }
+        else sscanf(p, "%259s", dir);
+        snprintf(path, sizeof path, "%s\\Admin\\Startup.txt", dir);
+        FILE *f = fopen(path, "r");
+        if (f) {
+            while (fgets(line, sizeof line, f)) {
+                const char *q = line;
+                while (*q == ' ' || *q == '\t') q++;
+                if (strncmp(q, "admin.password ", 15)) continue;
+                q += 15;
+                while (*q == ' ') q++;
+                if (*q == '"') { q++; const char *e = strchr(q, '"'); if (e) snprintf(g_password, sizeof g_password, "%.*s", (int)(e - q), q); }
+                else { char w[128] = ""; if (sscanf(q, "%127s", w) == 1) snprintf(g_password, sizeof g_password, "%s", w); }
+            }
+            fclose(f);
+        }
+    }
 }
 
 static int send_words(unsigned seq, int n, const char **words)
@@ -159,50 +182,43 @@ static int rcon_call(int n, const char **words, char **out, int maxOut, char *bu
     return 0;
 }
 
-// !map: find (or add) the map in the rotation with the current game mode, make it next and start it.
+// Friendly names of the map codes (for the !map list).
+static const char *map_friendly(const char *code)
+{
+    static const char *const t[][2] = {
+        {"MP_001", "bazaar"}, {"MP_003", "teheran"}, {"MP_007", "caspian"}, {"MP_011", "seine"}, {"MP_012", "firestorm"},
+        {"MP_013", "damavand"}, {"MP_017", "canals"}, {"MP_018", "kharg"}, {"MP_Subway", "metro"}, {"XP1_001", "karkand"},
+        {"XP1_002", "oman"}, {"XP1_003", "sharqi"}, {"XP1_004", "wake"}, {"XP2_Factory", "scrapmetal"}, {"XP2_Office", "operation925"},
+        {"XP2_Palace", "donya"}, {"XP2_Skybar", "ziba"}, {"XP3_Desert", "bandar"}, {"XP3_Alborz", "alborz"}, {"XP3_Shield", "shield"},
+        {"XP3_Valley", "valley"}, {"XP4_Quake", "markaz"}, {"XP4_FD", "talah"}, {"XP4_Rubble", "epicenter"}, {"XP4_Parl", "azadi"},
+        {"XP5_001", "riverside"}, {"XP5_002", "nebandan"}, {"XP5_003", "kiasar"}, {"XP5_004", "sabalan"}};
+    for (int k = 0; k < (int)(sizeof t / sizeof t[0]); k++) if (!_stricmp(t[k][0], code)) return t[k][1];
+    return code;
+}
+// !map <code>: only a map in THIS server's rotation (the user, 2026-10-13: each server keeps its own playlist and game
+// modes) - the rotation entry is made next and started, in the mode the rotation has for it.
 static void do_map(const char *code, const char *who)
 {
     static char buf[65536];
-    char *w[1024], mode[64] = "";
-    const char *info[1] = {"serverInfo"};
-    int n = rcon_call(1, info, w, 1024, buf, sizeof buf);
-    if (n >= 5 && !strcmp(w[0], "OK")) snprintf(mode, sizeof mode, "%s", w[4]);
-    // not every map has every mode: Aftermath (XP4) has no Conquest Large and Close Quarters (XP2) no Conquest at all -
-    // loading a map in a mode it lacks crashes the clients
-    // Conquest Large by default (also coming back from a Conquest Small / Domination map); other modes are kept
-    if (!mode[0] || !_strnicmp(mode, "Conquest", 8) || !_strnicmp(mode, "Domination", 10)) snprintf(mode, sizeof mode, "ConquestLarge0");
-    if (!_strnicmp(code, "XP4", 3) && !_stricmp(mode, "ConquestLarge0")) snprintf(mode, sizeof mode, "ConquestSmall0");
-    if (!_strnicmp(code, "XP2", 3) && !_strnicmp(mode, "Conquest", 8)) snprintf(mode, sizeof mode, "Domination0");
+    char *w[1024];
     const char *list[1] = {"mapList.list"};
-    n = rcon_call(1, list, w, 1024, buf, sizeof buf);
-    int idx = -1, count = 0;
+    int n = rcon_call(1, list, w, 1024, buf, sizeof buf);
+    int idx = -1, count = 0, per = 3;
+    char mode[64] = "";
     if (n >= 3 && !strcmp(w[0], "OK")) {
         count = atoi(w[1]);
-        int per = atoi(w[2]);
-        for (int k = 0; k < count && 3 + k * per < n; k++)
-            if (!_stricmp(w[3 + k * per], code) && (!mode[0] || !_stricmp(w[3 + k * per + 1], mode))) { idx = k; break; }
+        per = atoi(w[2]);
+        if (per < 2) per = 3;
+        for (int k = 0; k < count && 3 + k * per + 1 < n; k++)
+            if (!_stricmp(w[3 + k * per], code)) { idx = k; snprintf(mode, sizeof mode, "%s", w[3 + k * per + 1]); break; }
     }
-    char say[200];
-    if (idx < 0) {
-        if (!mode[0]) { chat_say("[BotMod] %s: cannot read the server's game mode", who); return; }
-        const char *add[4] = {"mapList.add", code, mode, "2"};
-        n = rcon_call(4, add, w, 1024, buf, sizeof buf);
-        // the map lacks that mode (Karkand / Sharqi / Wake only have Conquest Assault): take the first one it has
-        static const char *kFallback[] = {"ConquestLarge0", "ConquestAssaultLarge0", "ConquestSmall0", "ConquestAssaultSmall0"};
-        for (int f = 0; n >= 1 && !strcmp(w[0], "InvalidGameModeOnMap") && f < 4; f++) {
-            if (!_stricmp(kFallback[f], mode)) continue;
-            snprintf(mode, sizeof mode, "%s", kFallback[f]);
-            n = rcon_call(4, add, w, 1024, buf, sizeof buf);
-        }
-        if (n < 1 || strcmp(w[0], "OK")) { chat_say("[BotMod] %s: the server refused map %s (%s)", who, code, n ? w[0] : "no answer"); return; }
-        idx = count;
-    }
-    char idxs[16];
+    if (idx < 0) { chat_say("[BotMod] %s: %s is not in this server's map list - type !map to see it", who, map_friendly(code)); return; }
+    char say[200], idxs[16];
     snprintf(idxs, sizeof idxs, "%d", idx);
     const char *next[2] = {"mapList.setNextMapIndex", idxs};
     n = rcon_call(2, next, w, 1024, buf, sizeof buf);
     if (n < 1 || strcmp(w[0], "OK")) { chat_say("[BotMod] %s: could not select %s (%s)", who, code, n ? w[0] : "no answer"); return; }
-    snprintf(say, sizeof say, "[BotMod] %s is changing the map to %s (%s)", who, code, mode);
+    snprintf(say, sizeof say, "[BotMod] %s is changing the map to %s (%s)", who, map_friendly(code), mode);
     const char *s[3] = {"admin.say", say, "all"};
     rcon_call(3, s, w, 1024, buf, sizeof buf);
     Sleep(3000);   // let players read it: the map change clears the chat box (this thread only; the game keeps running)
@@ -210,15 +226,44 @@ static void do_map(const char *code, const char *who)
     rcon_call(1, run, w, 1024, buf, sizeof buf);
     g_log("chat: %s changed the map to %s (rotation index %d, %s)", who, code, idx, mode);
 }
+// !map with no name: this server's rotation, a few names per chat line
+static void do_map_list(void)
+{
+    static char buf[65536];
+    char *w[1024];
+    const char *list[1] = {"mapList.list"};
+    int n = rcon_call(1, list, w, 1024, buf, sizeof buf);
+    if (n < 3 || strcmp(w[0], "OK")) { chat_say("[BotMod] cannot read this server's map list"); return; }
+    int count = atoi(w[1]), per = atoi(w[2]);
+    if (per < 2) per = 3;
+    // just the names, once each, packed into as few chat lines as fit (the user: long lists scrolled off the screen; the
+    // server already decides the mode)
+    char line[128];
+    const char *done[64];
+    int nd = 0, m = snprintf(line, sizeof line, "[BotMod] maps:");
+    for (int k = 0; k < count && 3 + k * per < n && nd < 64; k++) {
+        const char *nm = map_friendly(w[3 + k * per]);
+        int dup = 0;
+        for (int q = 0; q < nd; q++) if (!strcmp(done[q], nm)) dup = 1;
+        if (dup) continue;
+        done[nd++] = nm;
+        if (m + 1 + (int)strlen(nm) > 120) { chat_say("%s", line); m = snprintf(line, sizeof line, "[BotMod]"); }
+        m += snprintf(line + m, sizeof line - m, " %s", nm);
+    }
+    chat_say("%s", line);
+}
 
 static volatile int g_maxPlayers;
 int chat_max_players(void) { return g_maxPlayers; }
+static char g_gameMode[64];          // serverInfo word 4, e.g. ConquestLarge0, TankSuperiority0, AirSuperiority0
+static volatile long g_modeLoads = -1;   // the level-load count it was read at (re-read after each load)
+void chat_game_mode(char *out, int n) { snprintf(out, n, "%s", g_gameMode); }
 // serverInfo: OK, name, players, maxPlayers, ... - asked now and then so admin changes to vars.maxPlayers are picked up
 static void poll_server_info(void)
 {
     static DWORD lastTick;
     DWORD now = GetTickCount();
-    if (g_maxPlayers && now - lastTick < 30000) return;
+    if (g_maxPlayers && now - lastTick < 30000 && g_modeLoads == g_levelLoads) return;   // (at once after a level load: the mode)
     lastTick = now;
     static char buf[4096];
     char *w[16];
@@ -227,6 +272,8 @@ static void poll_server_info(void)
     if (n >= 4 && !strcmp(w[0], "OK")) {
         int m = atoi(w[3]);
         if (m > 0 && m != g_maxPlayers) { g_log("chat: server allows %d players", m); g_maxPlayers = m; }
+        if (n >= 5 && strcmp(w[4], g_gameMode)) { g_log("chat: game mode %s", w[4]); snprintf(g_gameMode, sizeof g_gameMode, "%s", w[4]); }
+        g_modeLoads = g_levelLoads;
     }
 }
 
@@ -258,6 +305,7 @@ static DWORD WINAPI chat_worker(LPVOID unused)
             if (!have) break;
             if (msg[0] == '\x01') {   // "\x01map\t<code>\t<who>": needs replies, done here
                 char *code = strchr(msg, '\t'), *who = code ? strchr(code + 1, '\t') : NULL;
+                if (!strncmp(msg + 1, "maplist", 7)) { do_map_list(); continue; }
                 if (code && who) { *who = 0; do_map(code + 1, who + 1); }
                 continue;
             }
@@ -349,6 +397,8 @@ void chat_map(const char *code, const char *who)
 {
     chat_rcon("\x01map\t%s\t%s", code, who);
 }
+
+void chat_map_list(void) { chat_rcon("maplist"); }
 
 void chat_rcon(const char *fmt, ...)
 {

@@ -1,0 +1,3 @@
+# <level> <metres>: aircraft bots stay within this distance of the centre of all the flags (default 1500)
+# XP5_002 Nebandan: the user landed 1926 m out, 200-300 m inside the border (2026-10-13)
+XP5_002 1700

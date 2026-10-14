@@ -1,0 +1,8 @@
+# BotMod runtime output - never committed
+*.log
+BotModCore.loaded*.dll
+# per-map navigation / survey data (hundreds of MB, one file over GitHub's 100 MB limit): ships in the release zip
+BotMod_nav_*.bin
+BotMod_pave_*.bin
+BotMod_trees_*.bin
+BotMod_mat*_*.bin

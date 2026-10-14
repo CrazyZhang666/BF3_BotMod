@@ -67,6 +67,8 @@ int nav_is_water(const NavGrid *g, float x, float y, float z);
 // corridor of 2 cells or more). nav_set_path_mask(mask) makes nav_find_path stay on it (no ladders, fences, doorways);
 // NULL = soldiers again. The mask is the caller's (free with HeapFree on the process heap).
 unsigned char *nav_drive_mask(const NavGrid *g, int *count);
+// Looser mask for tanks on steep maps (steeper ground, no full link set), kept well off edges. Classes 2-4.
+unsigned char *nav_tank_mask(const NavGrid *g, int *count);
 // Strikes the drivable nodes within `radius` of (x, z) off the mask (a vehicle got stuck there). Returns how many.
 // Puts back the nodes nav_mask_block cleared around (x, z), from base (a copy taken before). Returns how many.
 int nav_mask_restore(const NavGrid *g, unsigned char *mask, const unsigned char *base, float x, float z, float radius);
@@ -129,3 +131,6 @@ int nav_path_link(int k);
 int nav_snap(const NavGrid *g, float x, float y, float z, float *out);
 // Body-width clearance test (3 parallel rays at knee and chest height) between two ground points.
 int nav_segment_clear(NavRayFn ray, const float *a, const float *b);
+void nav_set_vehicle_half(float h);
+void nav_mask_streets(const NavGrid *g, unsigned char *mask, const unsigned short *mats);   // street classes (the user's strip rule; mats may be NULL)
+unsigned char *nav_mask_clear_of(const NavGrid *g, const unsigned char *src, int maxClass, float radius, int *count);

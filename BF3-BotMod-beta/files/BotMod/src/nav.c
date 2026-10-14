@@ -29,6 +29,9 @@ static const unsigned char *g_pathMask;   // vehicles: only these nodes (NULL = 
 static int g_longLegs;                    // boats: straight lines across open water
 void nav_set_long_legs(int on) { g_longLegs = on; }
 void nav_set_path_mask(const unsigned char *mask) { g_pathMask = mask; }
+static float g_vehHalf = 1.5f;   // vehicles: half the width kept clear on a straight short cut
+static float g_hMul = 1.0f;      // the taxi map's dear off-street classes made A* search 60000 nodes on Karkand: greedier there
+void nav_set_vehicle_half(float h) { g_vehHalf = h > 0 ? h : 1.5f; g_hMul = h > 0 ? 2.0f : 1.0f; }
 static const unsigned char *g_treeDistSet;
 static const NavGrid *g_treeGrid;   // the grid the table belongs to (a table from another map is never read)
 static int g_treeW, g_treeH;
@@ -503,7 +506,7 @@ int nav_segment_clear(NavRayFn ray, const float *a, const float *b)
 {
     float dx = b[0] - a[0], dz = b[2] - a[2], len = sqrtf(dx * dx + dz * dz);
     if (len < 0.01f) return 1;
-    float half = g_pathMask ? 1.5f : BODY_HALF_WIDTH;   // vehicles: a car's width (poles and trees between grid points)
+    float half = g_pathMask ? g_vehHalf : BODY_HALF_WIDTH;   // vehicles: a car's width (poles and trees between grid points)
     float sx = -dz / len * half, sz = dx / len * half;
     const float heights[3] = {KNEE_HEIGHT, CHEST_HEIGHT, 0.35f};   // (vehicles also low: gabion corners, kerbs)
     const float side[7] = {0, 1, -1, 0.33f, -0.33f, 0.67f, -0.67f};   // (vehicles: 7 lines ~0.5 m apart - trees, poles)
@@ -765,6 +768,175 @@ unsigned char *nav_drive_mask(const NavGrid *g, int *count)
         }
         nav_release(m);
         m = e;
+    }
+    if (count) *count = ok;
+    return m;
+}
+
+// Tank mask (2026-10-13): steep mountain maps (Alborz) leave the drive mask in islands - a looser one for tracked
+// vehicles: walkable, dry, not under cover, neighbours within 1.4 m per cell (steeper than the drive mask's 0.7, no
+// full set of walking links needed). Kept well off rocks / walls / other drops: nodes within ~6 m of the area's edge
+// are the dearest class, the next ~4 m dear - routes run through the middle of open ground (the infantry route
+// hugged the rocks and tanks stuck on their edges).
+// Clear-of mask (2026-10-13, the Pilots' taxis): the nodes of src of class 1..maxClass with drivable ground (any class
+// but a tree's, within 2 m of the height) all round them out to radius - a car's centre that far from anything that
+// is not road (a wall, a parked truck, a drop). Taxis keep to the roads, 3 m clear of objects (the user).
+unsigned char *nav_mask_clear_of(const NavGrid *g, const unsigned char *src, int maxClass, float radius, int *count)
+{
+    int n = g->w * g->h * L, ok = 0, r = (int)(radius / g->cell + 0.999f);
+    unsigned char *m = nav_alloc((size_t)n);
+    if (!m || !src) return m;
+    for (int node = 0; node < n; node++) {
+        int c = src[node];
+        if (!c || c > maxClass) continue;
+        int cell = node / L, cx = cell % g->w, cz = cell / g->w, good = 1;
+        float h = g->height[node];
+        for (int dz = -r; dz <= r && good; dz++)
+            for (int dx = -r; dx <= r && good; dx++) {
+                if ((dx * dx + dz * dz) * g->cell * g->cell > radius * radius) continue;
+                int x2 = cx + dx, z2 = cz + dz, found = 0;
+                if (x2 < 0 || z2 < 0 || x2 >= g->w || z2 >= g->h) { good = 0; break; }
+                for (int l = 0; l < L && !found; l++) {
+                    int nb = (z2 * g->w + x2) * L + l;
+                    if (src[nb] && src[nb] != 5 && fabsf(g->height[nb] - h) < 2.0f) found = 1;
+                }
+                if (!found) good = 0;
+            }
+        if (good) { m[node] = (unsigned char)c; ok++; }
+    }
+    if (count) *count = ok;
+    return m;
+}
+
+int g_lastStreetNodes;   // street nodes the last nav_mask_streets found
+// Streets (the user's rule, 2026-10-13): a strip of ground that is the same all across a fixed width and at least
+// twice as long as it is wide. "The same": one ground material (mats, per node - Wake Island's dirt roads are a 400c
+// strip between 4013 verges, while its beaches are a wide 400c expanse) and no kerb (a height kink over 0.1 m across a
+// node - checked off terrain only: dirt roads are bumpy). In one of 4 directions the strip is 2..8 cells (4-16 m)
+// across and 2x that along. Street nodes away from the strip's edge class 1 (cheapest), at its edge 2; anything else
+// in the mask 4 (dear: pavements, squares, beaches, fields).
+void nav_mask_streets(const NavGrid *g, unsigned char *mask, const unsigned short *mats)
+{
+    int n = g->w * g->h * L, qh = 0, qt = 0, nst = 0;
+    unsigned char *dist = nav_alloc((size_t)n), *kerb = nav_alloc((size_t)n);
+    int *q = nav_alloc((size_t)n * sizeof(int));
+    if (!dist || !q || !kerb) { nav_release(dist); nav_release(q); nav_release(kerb); return; }
+    for (int node = 0; node < n; node++) {
+        if (!mask[node]) continue;
+        int nbs[8];
+        for (int d = 0; d < 8; d++) nbs[d] = step_node(g, node, d);
+        int terrain = mats && (mats[node] & 0xff00) == 0x4000;
+        for (int d = 0; d < 4 && !terrain; d++)
+            if (nbs[d] >= 0 && nbs[d + 4] >= 0 && fabsf(2.0f * g->height[node] - g->height[nbs[d]] - g->height[nbs[d + 4]]) > 0.1f) kerb[node] = 1;
+    }
+    // (mask value 7 on the way in: a prop beside it - an edge for the distances, never a street, the dearest class out)
+    #define SAME(a, b) (mask[b] && mask[b] != 7 && !kerb[b] && (!mats || mats[b] == mats[a]))
+    for (int node = 0; node < n; node++) {
+        if (!mask[node]) continue;
+        dist[node] = 255;
+        int edge = kerb[node];
+        for (int d = 0; d < 8 && !edge; d++) { int nb = step_node(g, node, d); if (nb < 0 || !SAME(node, nb)) edge = 1; }
+        if (edge) { dist[node] = 0; q[qt++] = node; }
+    }
+    while (qh < qt) {
+        int node = q[qh++];
+        for (int d = 0; d < 8; d++) {
+            int nb = step_node(g, node, d);
+            if (nb < 0 || !mask[nb] || dist[nb] <= dist[node] + 1) continue;
+            dist[nb] = dist[node] + 1;
+            q[qt++] = nb;
+        }
+    }
+    // distance (cells) from the mask's own edge - a wall, a bank, a parked truck: 3 m off objects where there is room, the
+    // middle of a narrow gap where there is not (the user, 2026-10-13: a dirt road between two obstacles on Firestorm)
+    unsigned char *de = nav_alloc((size_t)n);
+    if (de) {
+        qh = qt = 0;
+        for (int node = 0; node < n; node++) {
+            if (!mask[node]) continue;
+            de[node] = 255;
+            int edge = mask[node] == 7;
+            for (int d = 0; d < 8 && !edge; d++) { int nb = step_node(g, node, d); if (nb < 0 || !mask[nb] || mask[nb] == 5) edge = 1; }
+            if (edge) { de[node] = 0; q[qt++] = node; }
+        }
+        while (qh < qt) {
+            int node = q[qh++];
+            for (int d = 0; d < 8; d++) {
+                int nb = step_node(g, node, d);
+                if (nb < 0 || !mask[nb] || de[nb] <= de[node] + 1) continue;
+                de[nb] = de[node] + 1;
+                q[qt++] = nb;
+            }
+        }
+    }
+    for (int node = 0; node < n; node++) {
+        if (!mask[node] || mask[node] == 5) continue;
+        if (mask[node] == 7) { mask[node] = 6; continue; }
+        int street = 0, l = node % L, roofed = 0;
+        for (int k = 0; k < l && !roofed; k++) if ((g->flags[node - l + k] & NAV_WALKABLE) && g->height[node - l + k] - g->height[node] < 25.0f) roofed = 1;
+        if (!kerb[node] && !roofed)   // (under a roof - a hangar floor - is no street)
+            for (int d = 0; d < 4 && !street; d++) {
+                int across = 1, along = 1;
+                for (int sgn = 0; sgn < 2 && across <= 8; sgn++) {   // across: d+2 and d+6
+                    int c = node, dd = (d + 2 + sgn * 4) & 7;
+                    for (int k = 0; k < 9; k++) { int c2 = step_node(g, c, dd); if (c2 < 0 || !SAME(node, c2)) break; c = c2; across++; }
+                }
+                if (across < 2 || across > 8) continue;
+                int need = 2 * across > 12 ? 2 * across : 12;   // and 24 m at least (mottled ground paint made short "streets")
+                for (int sgn = 0; sgn < 2 && along < need; sgn++) {   // along: d and d+4
+                    int c = node, dd = (d + sgn * 4) & 7;
+                    for (int k = 0; k < need; k++) { int c2 = step_node(g, c, dd); if (c2 < 0 || !SAME(node, c2)) break; c = c2; along++; }
+                }
+                if (along >= need) street = 1;
+            }
+        int e = de ? de[node] : 2;
+        mask[node] = street ? (e >= 2 && dist[node] >= 1 ? 1 : e >= 1 ? 2 : 3) : (e >= 1 ? 4 : 6);   // 6: off-street against an edge (dearest)
+        nst += street;
+    }
+    #undef SAME
+    g_lastStreetNodes = nst;
+    nav_release(dist); nav_release(q); nav_release(kerb); nav_release(de);
+}
+
+unsigned char *nav_tank_mask(const NavGrid *g, int *count)
+{
+    int n = g->w * g->h * L, ok = 0;
+    unsigned char *m = nav_alloc((size_t)n);
+    if (!m) return NULL;
+    for (int node = 0; node < n; node++) {
+        if (!(g->flags[node] & NAV_WALKABLE) || (g->flags[node] & NAV_WATER)) continue;
+        int l = node % L, covered = 0;
+        for (int k = 0; k < l && !covered; k++) {
+            int up = node - l + k;
+            if ((g->flags[up] & NAV_WALKABLE) && g->height[up] - g->height[node] < 6.0f) covered = 1;
+        }
+        if (covered) continue;
+        int good = 1;
+        for (int d = 0; d < 8 && good; d++) {
+            int nb = step_node(g, node, d);
+            if (nb < 0 || (g->flags[nb] & NAV_WATER) || fabsf(g->height[nb] - g->height[node]) > 1.4f * g->cell / 2.0f * (d & 1 ? 1.41f : 1.0f)) good = 0;
+        }
+        if (!good) continue;
+        m[node] = 2;
+        ok++;
+    }
+    int ringHard = (int)(6.0f / g->cell + 0.99f), ringSoft = ringHard + (int)(4.0f / g->cell + 0.99f);
+    unsigned char *dist = nav_alloc((size_t)n);   // rings from the edge (0 = not in the mask)
+    if (dist) {
+        for (int node = 0; node < n; node++) {
+            if (!m[node]) continue;
+            for (int d = 0; d < 8; d++) { int nb = step_node(g, node, d); if (nb < 0 || !m[nb]) { dist[node] = 1; break; } }
+        }
+        for (int r = 1; r < ringSoft; r++)
+            for (int node = 0; node < n; node++) {
+                if (dist[node] != r) continue;
+                for (int d = 0; d < 8; d++) { int nb = step_node(g, node, d); if (nb >= 0 && m[nb] && !dist[nb]) dist[nb] = (unsigned char)(r + 1); }
+            }
+        for (int node = 0; node < n; node++) {
+            if (!m[node] || !dist[node]) continue;
+            m[node] = dist[node] <= ringHard ? 4 : 3;
+        }
+        nav_release(dist);
     }
     if (count) *count = ok;
     return m;
@@ -1248,7 +1420,7 @@ int nav_find_path(const NavGrid *g, NavRayFn ray, float sx, float sy, float sz, 
     const unsigned char *g_roadMask = ROAD_MASK(g), *g_treeDist = TREE_DIST(g);   // (only this grid's tables)
     // vehicles: the full weight too (0.5 kept it exact for the cheap paved roads - and searched half of a big map: a
     // Damavand re-route froze the server 1.5 s); a road-hugging route a little less than perfect plans in a fraction
-    float hw = ASTAR_HEURISTIC_WEIGHT * (g_pathMask ? 1.0f : g_roadMask ? 0.6f : 1.0f);
+    float hw = ASTAR_HEURISTIC_WEIGHT * (g_pathMask ? g_hMul : g_roadMask ? 0.6f : 1.0f);
     int maxExpanded = 60000;   // (an unreachable goal used to search a whole big map - ~100 ms - and bots retried every second)
     gs[start] = 0; from[start] = -1; stamp[start] = curStamp;
     heap_push(heap, &hn, 0, start);
@@ -1266,7 +1438,7 @@ int nav_find_path(const NavGrid *g, NavRayFn ray, float sx, float sy, float sz, 
             if ((d & 1) && step_node(g, cur, (d + 7) & 7) < 0 && step_node(g, cur, (d + 1) & 7) < 0) continue;
             float climb = g->height[nb] - g->height[cur];
             float step = ((d & 1) ? 1.4142f : 1.0f) * g->cell;
-            static const float kDriveCost[8] = {1.0f, 0.5f, 1.0f, 1.6f, 2.5f, 12.0f, 1.0f, 1.0f};   // 5: within 2.5 m of a tree
+            static const float kDriveCost[8] = {1.0f, 0.5f, 1.0f, 1.6f, 2.5f, 12.0f, 4.0f, 1.0f};   // 5: within 2.5 m of a tree; 6: taxi map, off-street at an edge
             float mul = g_pathMask ? kDriveCost[g_pathMask[nb] & 7] : (g->flags[nb] & NAV_WATER) ? WATER_COST_MUL :
                         g_roadMask && g_roadMask[nb] == 1 ? 0.6f : g_roadMask && g_roadMask[nb] == 2 ? 0.85f : 1.0f;   // roads
             if (!g_pathMask && g_treeDist && g_treeDist[nb] <= TREE_NEAR_DM) mul *= 6.0f;   // round a tree, not into it
