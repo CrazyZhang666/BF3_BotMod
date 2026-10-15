@@ -65,3 +65,8 @@
 02504b6c Persistence/Unlocks/Vehicles/LbtSmokeLaunchers
 02504b6c Persistence/Unlocks/Vehicles/LbtCoaxLMG
 02504b6c Persistence/Unlocks/Vehicles/IfvCoax
+02504b6c Persistence/Unlocks/Vehicles/AtkHeliHeatseekerMissile
+02504b6c Persistence/Unlocks/Vehicles/AtkHeliFlareLauncher
+02504b6c Persistence/Unlocks/Vehicles/ScoutAAMissile
+02504b6c Persistence/Unlocks/Vehicles/ScoutFlares
+02504b34 Weapons/FIM92A/U_FIM92

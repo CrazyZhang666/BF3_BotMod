@@ -11,6 +11,7 @@ void chat_stop(void);
 int chat_poll(char *who, int whoLen, char *text, int textLen);
 // Queues a message for everyone (split to the 128-character chat limit).
 void chat_say(const char *fmt, ...);
+void chat_say_team(int team, const char *fmt, ...);
 // Queues any RCON command; words separated by tabs, e.g. "admin.movePlayer\t<name>\t1\t2\tfalse".
 void chat_rcon(const char *fmt, ...);
 // The server's current player limit (vars.maxPlayers via RCON serverInfo, refreshed every 30 s); 0 = not known yet.

@@ -828,9 +828,11 @@ static void load_loadouts(void)
                 continue;
             }
             if (sscanf(el, "%31s %d %255s", cls, &slot, asset) != 3 || slot < 0 || slot > 9) continue;
+            int onlyTeam = 0;   // "<class>:<team>" - one side only (e.g. "Support:1" US Stingers, "Support:2" RU Iglas)
+            { char *cl = strchr(cls, ':'); if (cl) { onlyTeam = atoi(cl + 1); *cl = 0; } }
             for (int k = 0; k < lib->count; k++) {
                 Loadout *X = &lib->l[k];
-                if (_stricmp(kit_class(X->kit), cls)) continue;
+                if (_stricmp(kit_class(X->kit), cls) || (onlyTeam && X->team != onlyTeam)) continue;
                 unsigned char *m = NULL;
                 for (int w = 0; w < X->nWeapons && !m; w++) if (*(int *)(X->weaponMsg[w] + 0x38) == slot) m = X->weaponMsg[w];
                 if (!m && X->nWeapons > 0 && X->nWeapons < KIT_MAX_WEAPONS) {   // a slot the kit leaves empty: a copy of its first entry
@@ -2377,7 +2379,10 @@ static void vehicle_mark_bad(char *v, int sec);
 static int driver_seat_free(char *veh);
 static int pilot_heading_for_ride(int i);
 static int pilot_ride_ours(char *v, int team);
-static int pilot_ride_kind(int k);   // a Pilot whose team has tanks / jets on this map: HQ spawns, waits for one
+static int pilot_ride_kind(int k);
+static int pilot_wants_air(int i);
+#define RIDE_CATS 5
+static unsigned g_catTakenAt[3][RIDE_CATS];   // (see ride_cat)   // a Pilot whose team has tanks / jets on this map: HQ spawns, waits for one
 static unsigned char g_flyTakeoff[MAX_BOTS];
 static float g_flyTakeoffAlt[MAX_BOTS];   // altitude where the take-off run began (a runway's AGL ray reads nothing: starts underground)
 static unsigned g_jetUpAt[3];   // (jet_idle_tick: a jet of that side last seen flying)
@@ -2392,6 +2397,10 @@ static unsigned g_intoJet[MAX_BOTS];   // a Pilot to put straight into a free je
                                        // first spawns come before the jets do)
 static int g_airSpawnJetsOnly;   // outside Air Superiority: only a spawn point holding a live, parked jet (one put a Pilot in a Venom)   // Air Superiority: a Pilot spawns straight into a jet (a CharacterSpawnEntity with one)
 static void pilot_air_tick(int i);
+static unsigned char g_rideWait[MAX_BOTS];   // waiting for a ride (holds a post where it stands - no gadgets: see ride_wait_tick)
+__declspec(dllexport) void botmod_command(char *line);
+static unsigned g_dropAt[MAX_BOTS];   // when a driver last dropped this bot off: not called back in for a minute (the user)
+static void ride_request(char *caller, const float *p);
 // Air leash (the user, 2026-10-13: dogfights carried jets out of the map and they blew up): no aircraft goes further
 // than this from the centre of all the flags. BotMod\BotMod_bounds.txt "<level> <metres>"; 1500 if not listed.
 // Nebandan (XP5_002): the user landed 1926 m out, 200-300 m inside the border -> 1700.
@@ -2449,6 +2458,83 @@ static unsigned char g_stallSet[MAX_BOTS];
 static unsigned g_stallEngaged[MAX_BOTS], g_lastEngagedAt[MAX_BOTS], g_pushUntil[MAX_BOTS], g_flankUntil[MAX_BOTS];
 static int g_stallCount[MAX_BOTS];
 static void stall_tick(int i, BotBrain *b, char *soldier);
+// (helicopter hold - see heli_tick)
+static unsigned char g_heliHold[MAX_BOTS];
+static float g_heliAlt[MAX_BOTS], g_heliWantPitch[MAX_BOTS], g_heliWantBank[MAX_BOTS], g_heliTrim[MAX_BOTS];
+static float g_heliLastAlt[MAX_BOTS], g_heliVs[MAX_BOTS], g_heliLastPitch[MAX_BOTS], g_heliLastBank[MAX_BOTS];
+static float g_heliTapRoll[MAX_BOTS], g_heliTapYaw[MAX_BOTS];
+static unsigned g_heliTapUntil[MAX_BOTS], g_heliLogAt[MAX_BOTS];
+static int g_heliRollSign = 1;   // roll stick + raises bank (measured on a Venom, 2026-10-14); console "heliroll <1|-1|0>"
+static unsigned char g_heliGo[MAX_BOTS];                // heligo: flying to g_heliGoal (x, z), then hovering over it
+static float g_heliGoal[MAX_BOTS][2], g_heliVel[MAX_BOTS][2], g_heliLastXZ[MAX_BOTS][2], g_heliWantHdg[MAX_BOTS];
+static float g_heliMaxSpeed = 30.0f;                    // console "helispeed <m/s>"
+// Landing (the user's technique, 2026-10-14): hover over the spot, let it settle down with the collective just under a hover
+// (light "S" taps at most - never held), and only about 1 m above the ground cut it (full "S") to plant the skids; keep "S"
+// held to stay down. 0 none, 1 to the spot, 2 settling down, 3 cut (planting), 4 landed.
+static unsigned char g_heliLand[MAX_BOTS];
+static unsigned g_heliLandAt[MAX_BOTS];
+static float g_heliGroundH[MAX_BOTS];
+static unsigned char g_heliGroundFlat[MAX_BOTS];
+static unsigned char g_heliBlocked[MAX_BOTS];   // the look-ahead found something on its way: no headway, climbing
+// A transport helicopter on a pickup (the user, 2026-10-15): 0 free, 1 to the pickup, 2 down at it ("Get in!"), 3 boarding
+// (5 s after the first is in), 4 to the flag, 5 over it ("Get out!" - they bail out), 6 home (lands where it started)
+static unsigned char g_heliRide[MAX_BOTS];
+static float g_heliHome[MAX_BOTS][3];
+static unsigned g_heliRideAt[MAX_BOTS], g_heliCallAt[MAX_BOTS];
+static int g_heliDropFlag[MAX_BOTS];
+static float g_heliLz[MAX_BOTS][4];          // a surveyed landing zone: x, ground y, z, heading along its long axis (degrees)
+static unsigned char g_heliLzOk[MAX_BOTS];
+static float g_heliBase[MAX_BOTS][4];        // its base (the HQ pad): x, ground y, z, heading - where it goes home to
+static unsigned char g_heliBaseOk[MAX_BOTS]; // 0: not known yet, 1: a spot (its pad), 2: a surveyed zone (heading known)
+// Attack helicopter strafing runs (the user, 2026-10-15: runs, as the jets): 1 set-up (600 m out, 80 m over the target's
+// ground), 2 the run (a shallow dive, nose on the lead point, rocket salvos from 450 m to 150 m), 3 the break (right and away,
+// back up), then set up again. Console "heliattack <bot#> <player> | off".
+#define HELI_RKT_SPEED 300.0f   // the Mi-28 pilot's rocket pods (vguns, 2026-10-15; ~348 m/s in flight with the helicopter's speed)
+static unsigned char g_heliAtk[MAX_BOTS];
+static char *g_heliAtkTgt[MAX_BOTS];
+static float g_heliAtkLast[MAX_BOTS][3], g_heliAtkVel[MAX_BOTS][3], g_heliAtkB[MAX_BOTS][2];
+static unsigned g_heliAtkFireAt[MAX_BOTS], g_heliAtkLogAt[MAX_BOTS];
+// Auto (the user, 2026-10-15): scan for a target, one strafing pass, then a cool-down 60 m over the ground - open to "Need
+// pickup" (a Littlebird carries troops too) - and scan again. Console "heliauto <bot#> [off]".
+static unsigned char g_heliAuto[MAX_BOTS];
+// The pass plan (the user, 2026-10-15: after a pass its momentum carried it into a cliff): before each pass, 24 axes x 2
+// directions round the target - the whole line clear at attack height (run-in start to the far end), the line of fire, and
+// 100 m of turning room to one side at both ends; the cheapest = the least time to its start (the direct line from where it is
+// wins if within ~5 s of the best). Full length first, then shorter run-ins.
+static float g_heliPlanD[MAX_BOTS][2], g_heliPlanT[MAX_BOTS][3], g_heliPlanIn[MAX_BOTS], g_heliPlanOut[MAX_BOTS];
+static signed char g_heliPlanSide[MAX_BOTS];   // the far end's turn: +1 towards +angle, -1 the other way
+static unsigned char g_heliPlanned[MAX_BOTS];
+static unsigned char g_heliPlanKind[MAX_BOTS], g_heliNoOnIt[MAX_BOTS];   // (no "on it already" for the re-plan after a pivot)   // 0 the best surveyed line (kept: back and forth on it), 1 straight in, 2 on it already
+static float g_heliMgPitch = -0.7f;               // a minigun's aim trim, degrees (- = lower; it shot over the user) - "heliatkmgpitch"
+// Helicopter against helicopter (the user, 2026-10-15): an enemy helicopter in the air - weapon 2 (heat-seekers, kit unlock
+// ScoutAAMissile / AtkHeliHeatseekerMissile), the nose on it until BotMod's lock (the jets' g_seekRange / g_seekCone /
+// g_seekTime), both missiles 1 s apart (each given the target's aircraft, as the jets'), then weapon 1 - minigun runs at its
+// height. 0 none, 1 missiles, 2 guns. Missiles again 20 s later.
+static unsigned char g_heliAir[MAX_BOTS], g_heliMslShot[MAX_BOTS];
+static unsigned g_heliMslReadyAt[MAX_BOTS], g_heliLockSince[MAX_BOTS], g_heliMslAt[MAX_BOTS];
+#define HELI_LOCK_TIME 2.0f   // s: a helicopter fight is close and short (the jets' 4 s lock never completed)
+static unsigned g_heliAutoScanAt[MAX_BOTS];
+static void heli_auto_tick(int i, char *veh);
+static float g_heliAtkFireMax[MAX_BOTS], g_heliAtkBrk[MAX_BOTS];
+static float g_heliMgH = 40.0f, g_heliMgR = 220.0f, g_heliMgFire = 180.0f, g_heliMgBrk = 50.0f, g_heliAtkYaw = 0.0f;   // (+ "heliatkyaw <deg>": a
+                                                                                                    // heading trim on the aim, + = right)   // a minigun's run (low - the user)
+                                                                                                    // - console "heliatkmg <h> <r> <fire> <break>"   // the gun's fire window: opens at / breaks off at (m)
+static int heli_ray_ground(float x, float z, float top, float bottom, float *y);
+static float g_heliAtkH = 180.0f, g_heliAtkR = 700.0f;   // the run's set-up: height over the target, range (console "heliatkcfg <h> <r>")
+// The pilot's rocket pods' loaded rounds: weapon component [+1c4]+68 (found 2026-10-15 on the Mi-28: 14, three a half
+// second, refilled to 14 ~5 s after empty). The pilot's own pod is the one that counts down when the trigger is held.
+static char *g_heliAtkW[MAX_BOTS][4];
+static int g_heliAtkFull[MAX_BOTS][4], g_heliAtkNW[MAX_BOTS], g_heliAtkPod[MAX_BOTS];
+static float g_heliAtkSpd[MAX_BOTS][4];
+static unsigned char g_heliAtkHeat[MAX_BOTS][4];   // 1: a minigun - no rounds, it overheats ([+1c4]+78: 0..1, ~0.3/s up firing, down cooling)
+static int vweapon_rounds(char *w);
+static void heli_find_pods(int i, char *veh);
+static int heli_pod_rounds(int i);
+// (high and steep - the user, 2026-10-15: over the buildings, and a top-down salvo lands closer together)
+static void heli_ride_tick(int i, char *veh);
+static float g_heliRayH[MAX_BOTS][5], g_heliRayXZ[MAX_BOTS][5][2];   // each ray's world offset (x, z) from the helicopter
+static float g_heliShift[MAX_BOTS];
+#define HELI_SKID_H 2.6f   // its centre above its skids   // how far a landing has slid off its spot looking for flat ground   // each ground ray's height below the helicopter (-1: no hit)   // all 5 ground rays within 0.5 m of each other   // height above the ground under it (4 rays just outside the hull, the highest surface)
 static unsigned char g_winPhase[MAX_BOTS];   // getting out of a closed-off room through a window (0 = not)
 static int window_escape_start(int i, char *soldier);
 static int g_winDebug;
@@ -2906,6 +2992,12 @@ static unsigned g_seekShots[MAX_BOTS], g_seekGunsUntil[MAX_BOTS], g_seekNoLockSi
 static unsigned char g_seekTurnFight[MAX_BOTS];   // (+ close in with no lock for 8 s: guns)
 static float g_seekReload = 15.0f;
 static int g_seekFireEia = 7;    // EIAFire with the seekers selected (verified 2026-10-13; needs JetHeatseekerStance in the kit)
+static int g_mslPosHunt;
+#define RKT_MAX 32
+static struct { char *obj; int bot; float pos[3]; unsigned at; } g_rkt[RKT_MAX];   // a strafing helicopter's rockets in flight
+static void rkt_note(char *o, int bot);
+static int g_rktBot = -1; static unsigned g_rktAt;   // a strafing helicopter holding its trigger (rockets carry no shooter)
+static void rkt_tick(void);   // console "mslpos 1": find the missile object's position field (research)
 static int g_mslDebug;                          // console "msldebug 1": dump every new missile-class object
 static int g_flareEia = 10;                     // EIAFireCountermeasure (VU's enum; console "flare <bot#> [n] [eia]")
 static char *g_flyChase[MAX_BOTS];             // console "flychase": the player whose aircraft it hunts
@@ -3035,7 +3127,7 @@ static void stranded_in_vehicle_tick(int i)
         char *occ = *(char **)(b[k] + 0x4c);
         if (!occ || occ == pl) continue;
         if (!is_bot(occ)) cared = 1;   // a human aboard: riding with them is the point
-        else { int j = bot_index(occ); if (j >= 0 && g_drive[j].phase && g_drive[j].veh == veh) cared = 1; }   // a bot driving it
+        else { int j = bot_index(occ); if (j >= 0 && ((g_drive[j].phase && g_drive[j].veh == veh) || g_heliHold[j])) cared = 1; }   // a bot driving / flying it
     }
     if (cared) { g_strandedSince[i] = 0; return; }
     if (!g_strandedSince[i]) { g_strandedSince[i] = H->frame ? H->frame : 1; return; }
@@ -3076,8 +3168,9 @@ static void place_class_gadget(int i, char *soldier)
     if (dx * dx + dz * dz < 15.0f * 15.0f) return;   // already placed something around here
     int slot;
     const char *what = NULL;
-    if ((slot = bot_gadget_slot(i, "Claymore", NULL)) >= 0 && g_claymores[i] < 2) { g_claymores[i]++; what = "claymore"; }
-    else if ((slot = bot_gadget_slot(i, "UGS", NULL)) >= 0 && g_tugs[i] < 1) { g_tugs[i]++; what = "T-UGS"; }
+    // a Recon: its T-UGS first, then claymores once that is down (the user, 2026-10-15: claymores in the old beacon slot)
+    if ((slot = bot_gadget_slot(i, "UGS", NULL)) >= 0 && g_tugs[i] < 1) { g_tugs[i]++; what = "T-UGS"; }
+    else if ((slot = bot_gadget_slot(i, "Claymore", NULL)) >= 0 && g_claymores[i] < 2) { g_claymores[i]++; what = "claymore"; }
     else if ((slot = bot_gadget_slot(i, "M15", NULL)) >= 0 && g_mines[i] < 2) {   // AT mine: only where vehicles drive
         const unsigned char *dm = drive_mask();
         NavGrid *g = *nav_slot();
@@ -3505,9 +3598,15 @@ static int bot_spot(char *spotter, char *target);
 static float g_leadPos[MAX_BOTS][3], g_leadVel[MAX_BOTS][3];
 static void *g_leadWho[MAX_BOTS];
 static unsigned g_leadAt[MAX_BOTS];
+// an aircraft target (set by the caller around lead_point): its speed is real up to 400 m/s (the 45 m/s "teleport" cap threw
+// every jet's and fast helicopter's velocity away - the AA guns had next to no lead, 2026-10-14), and it climbs / dives: lead
+// it vertically too, with extra lag for the turret
+static int g_leadAir;
+static float g_aaLeadMul = 1.5f;   // console "aalead <x>": the AA guns' lead on top of the flight time
 static void lead_point(int i, void *who, const float *tp, float dist, float *out)
 {
     unsigned now = H->frame;
+    float vmax = g_leadAir ? 400.0f : 45.0f;
     if (g_leadWho[i] != who || now - g_leadAt[i] > 45) {
         g_leadWho[i] = who;
         memcpy(g_leadPos[i], tp, 12);
@@ -3518,22 +3617,23 @@ static void lead_point(int i, void *who, const float *tp, float dist, float *out
         // between actual changes over the time they took - frame-to-frame it read 0 m/s, then a "teleport" jump
         float mx = tp[0] - g_leadPos[i][0], mz = tp[2] - g_leadPos[i][2];
         float dt = (now - g_leadAt[i]) / 30.0f;
-        if (mx * mx + mz * mz > 0.0004f) {
-            for (int k = 0; k < 3; k += 2) {   // horizontal only (jumps / terrain bumps would make it bob)
+        if (mx * mx + mz * mz > 0.0004f || (g_leadAir && fabsf(tp[1] - g_leadPos[i][1]) > 0.02f)) {
+            for (int k = 0; k < 3; k += g_leadAir ? 1 : 2) {   // on foot / ground: horizontal only (jumps / terrain bumps would make it bob)
                 float v = (tp[k] - g_leadPos[i][k]) / dt;
-                if (fabsf(v) > 45.0f) v = g_leadVel[i][k];   // teleport / respawn
+                if (fabsf(v) > vmax) v = g_leadVel[i][k];   // teleport / respawn
                 g_leadVel[i][k] = 0.5f * g_leadVel[i][k] + 0.5f * v;
             }
             memcpy(g_leadPos[i], tp, 12);
             g_leadAt[i] = now;
         } else if (dt > 1.0f) {   // really standing still
-            g_leadVel[i][0] = g_leadVel[i][2] = 0;
+            g_leadVel[i][0] = g_leadVel[i][1] = g_leadVel[i][2] = 0;
             g_leadAt[i] = now;
         }
     }
     float t = dist / BULLET_SPEED + AIM_LAG_SECONDS;
+    if (g_leadAir) t = (dist / BULLET_SPEED + 0.25f) * g_aaLeadMul;
     out[0] = tp[0] + g_leadVel[i][0] * t;
-    out[1] = tp[1];
+    out[1] = tp[1] + (g_leadAir ? g_leadVel[i][1] * t : 0.0f);
     out[2] = tp[2] + g_leadVel[i][2] * t;
 }
 
@@ -4655,7 +4755,7 @@ static int task_tick(int i, BotBrain *b, char *soldier)
                 bot_crouch(i);
                 b->crouched = 1;
                 bot_log("brain: %s holding post at (%.1f, %.1f)", (char *)H->bots[i] + OFF_PLAYER_ONLINE_NAME, b->postPos[0], b->postPos[2]);
-                if (!pilot_heading_for_ride(i)) place_class_gadget(i, soldier);   // (a Pilot at its ride: no mines - Pilot US 2 knelt by one)
+                if (!pilot_heading_for_ride(i) && !g_rideWait[i]) place_class_gadget(i, soldier);   // (not while waiting for a ride: they cluttered the HQ with markers)   // (a Pilot at its ride: no mines - Pilot US 2 knelt by one)
             }
         }
         return 1;
@@ -4764,6 +4864,7 @@ static void order_reaction(char *sender, int type, char *target)
                 if (o->task == TASK_FOLLOW && o->commander == sender) continue;   // already coming
                 if (g_drive[j].phase) continue;                                    // off to drive its own
                 if (is_pilot(j) && is_bot(sender)) continue;                       // a Pilot rides with no bot (the user): it drives its own
+                if (g_dropAt[j] && H->frame - g_dropAt[j] < 60 * 30) continue;    // just dropped off: it has a flag to take
                 float d = bot_distance_to(j, sp);
                 if (d < bestD) { bestD = d; i = j; }
             }
@@ -4889,7 +4990,9 @@ static void order_reaction(char *sender, int type, char *target)
             b->crouched = 0;
             bot_say_later(i, ORDER_ROGERTHAT, SAY_DELAY_FRAMES);
             bot_log("brain: %s will defend %s's position (%.0f m away)", (char *)H->bots[i] + OFF_PLAYER_ONLINE_NAME, who, d);
-        }    } else if (type == ORDER_REQUESTAMMO || type == ORDER_REQUESTHEAL || type == ORDER_REQUESTRIDE) {
+        }    } else if (type == ORDER_REQUESTRIDE) {   // "Need pickup": no more radio beacons (the user, 2026-10-15) - the transport board
+        ride_request(sender, sp);
+    } else if (type == ORDER_REQUESTAMMO || type == ORDER_REQUESTHEAL || type == ORDER_REQUESTRIDE) {
         int heal = type == ORDER_REQUESTHEAL, ride = type == ORDER_REQUESTRIDE;
         const char *what = heal ? "medkit" : ride ? "radio beacon" : "ammo";
         // closest bot that carries the gadget; if none does, the closest bot declines
@@ -5244,6 +5347,42 @@ static int soldier_ammo2(char *soldier, int slot, int *loaded, int *spare)
         if (l < 0 || l > 500 || s < 0 || s > 2000) return 0;
         *loaded = l; *spare = s;
         return 1;
+    }
+    return 0;
+}
+// A vehicle weapon's loaded / spare rounds: the same firing block as a soldier's weapon (markers 24, 344), searched in the
+// weapon component itself (research: console "vammo <bot#>")
+static int ammo_block_in(char *b, int *loaded, int *spare, int *at)
+{
+    if (!b || (unsigned)b < 0x10000u || IsBadReadPtr(b, 0x800)) return 0;
+    for (int o = 0; o + 0x118 <= 0x800; o += 4) {
+        if (*(int *)(b + o + 0x14) != 24 || *(int *)(b + o + 0x18) != 344) continue;
+        int l = *(int *)(b + o + 0x110), s = *(int *)(b + o + 0x114);
+        if (l < 0 || l > 5000 || s < 0 || s > 20000) continue;
+        *loaded = l; *spare = s; *at = o;
+        return 1;
+    }
+    return 0;
+}
+static char *g_vammoPath;   // (research: where it was found, for the log)
+static int vweapon_ammo(char *w, int *loaded, int *spare)
+{
+    static char path[64];
+    int at;
+    g_vammoPath = path;
+    if (ammo_block_in(w, loaded, spare, &at)) { snprintf(path, sizeof path, "+%x", at); return 1; }
+    if (!w || IsBadReadPtr(w, 0x400)) return 0;
+    for (int a = 0; a < 0x400; a += 4) {   // one pointer away, then two
+        char *p1 = *(char **)(w + a);
+        if (ammo_block_in(p1, loaded, spare, &at)) { snprintf(path, sizeof path, "[+%x]+%x", a, at); return 1; }
+    }
+    for (int a = 0; a < 0x200; a += 4) {
+        char *p1 = *(char **)(w + a);
+        if (!p1 || (unsigned)p1 < 0x10000u || IsBadReadPtr(p1, 0x200)) continue;
+        for (int b2 = 0; b2 < 0x200; b2 += 4) {
+            char *p2 = *(char **)(p1 + b2);
+            if (ammo_block_in(p2, loaded, spare, &at)) { snprintf(path, sizeof path, "[[+%x]+%x]+%x", a, b2, at); return 1; }
+        }
     }
     return 0;
 }
@@ -6721,8 +6860,8 @@ static void cmd_spawn(const char *name)
         // any other mode: no jet of ours up for 60 s - this Pilot goes straight into a free one of ours on its first tick
         // alive (the parked jets' spawn points hold only a template - Wake's carrier jets never flew); the clock restarts
         // so the next Pilot does not take the other jet too
-        if (bi >= 0 && is_pilot(bi) && (team == 1 || team == 2) && H->frame - g_jetUpAt[team] > 60 * 30) {
-            g_jetUpAt[team] = H->frame;
+        if (bi >= 0 && is_pilot(bi) && (team == 1 || team == 2) && (int)(H->frame - g_jetUpAt[team]) > 60 * 30 && pilot_wants_air(bi)) {
+            g_jetUpAt[team] = H->frame; g_catTakenAt[team][3] = H->frame ? H->frame : 1;
             g_intoJet[bi] = H->frame + 15 * 30;
             bot_log("pilot: '%s' - no jet of ours up for a minute: into one straight after spawning", name);
         }
@@ -7235,7 +7374,10 @@ __declspec(dllexport) void botmod_command(char *line)
         int i = -1, k = -1;
         char **vehs;
         int nv = vehicle_list(&vehs);
-        if (sscanf(line + 6, "%d %d", &i, &k) != 2 || i < 0 || i >= H->botCount || k < 0 || k >= nv) { bot_log("usage: drive <bot#> <veh#>"); return; }
+        unsigned addr = 0;   // (or "drive <bot#> @<address>": list numbers shift as vehicles spawn / die)
+        if (sscanf(line + 6, "%d @%x", &i, &addr) == 2) { for (int q = 0; q < nv; q++) if ((unsigned)vehs[q] == addr) k = q; }
+        else sscanf(line + 6, "%d %d", &i, &k);
+        if (i < 0 || i >= H->botCount || k < 0 || k >= nv) { bot_log("usage: drive <bot#> <veh# | @address>"); return; }
         char **b;
         if (IsBadReadPtr(vehs[k], 0x200) || *(unsigned *)vehs[k] != ADDR_VEHICLE_VTABLE || !vehicle_seats(vehs[k], &b) || *(void **)(b[0] + 0x4c)) {
             bot_log("drive: no free driver's seat");
@@ -7367,9 +7509,158 @@ __declspec(dllexport) void botmod_command(char *line)
             n++;
         }
         bot_log("vguns: %d weapon(s) near the %s", n, vehicle_name(veh));
+    } else if (!strncmp(line, "vsnap ", 6) || !strncmp(line, "vdiff ", 6) || !strncmp(line, "vdifff ", 7) || !strncmp(line, "vdiffr ", 7)) {   // vsnap <hex> / vdiff <hex>: an object (+ what it points
+        // to, one level) before / after - the ints that went down a little (research: a vehicle weapon's ammo counter)
+        #define VS_OBJS 256
+        static char *base[VS_OBJS]; static int nb, src[VS_OBJS]; static unsigned char snap[VS_OBJS][0x800];
+        unsigned a = 0; sscanf(line + (line[5] == 'f' || line[5] == 'r' ? 7 : 6), "%x", &a);
+        char *w = (char *)a;
+        if (!w || IsBadReadPtr(w, 0x800)) { bot_log("vsnap: bad address"); return; }
+        if (line[1] == 's') {
+            nb = 0; base[nb] = w; memcpy(snap[nb++], w, 0x800);
+            for (int o = 0; o < 0x800 && nb < VS_OBJS; o += 4) {
+                char *p1 = *(char **)(w + o);
+                if (!p1 || (unsigned)p1 < 0x10000u || IsBadReadPtr(p1, 0x800)) continue;
+                int dup = 0; for (int q = 0; q < nb; q++) if (base[q] == p1) dup = 1;
+                if (dup) continue;
+                base[nb] = p1; src[nb] = o; memcpy(snap[nb++], p1, 0x800);
+            }
+            bot_log("vsnap: %d object(s) saved", nb);
+        } else {
+            int shown = 0;
+            for (int q = 0; q < nb && shown < 40; q++) {
+                if (IsBadReadPtr(base[q], 0x800)) continue;
+                for (int o = 0; o < 0x800 && shown < 40; o += 4) {
+                    int was = *(int *)(snap[q] + o), now = *(int *)(base[q] + o);
+                    if (now < was && was - now <= 40 && was <= 500 && now >= 0) {
+                        bot_log("vdiff: obj %d (%p, %s+%x) +%x: %d -> %d", q, base[q], q ? "ptr at" : "self", q ? src[q] : 0, o, was, now);
+                        shown++;
+                    }
+                    float fw = *(float *)(snap[q] + o), fn = *(float *)(base[q] + o);   // a heat level: a float that rose, 0..1 or 0..100
+                    if (((line[5] == 'f' && fw > fn + 0.02f) || (line[5] == 'r' && fn > fw + 0.1f)) && fn >= 0.0f && fw >= 0.0f && fw <= 1.5f && fn <= 1.5f && fw == fw && fn == fn) {   // (a 0..1 level: fell / rose)
+                        bot_log("vdiff: obj %d (%p, %s+%x) +%x: float %.3f -> %.3f", q, base[q], q ? "ptr at" : "self", q ? src[q] : 0, o, fw, fn);
+                        shown++;
+                    }
+                }
+            }
+            bot_log("vdiff: %d candidate(s)", shown);
+        }
+    } else if (!strncmp(line, "vpeek ", 6)) {   // vpeek <hex> <hex off> ...: floats at those offsets (research)
+        unsigned a = 0, o[6]; int n = sscanf(line + 6, "%x %x %x %x %x %x %x", &a, &o[0], &o[1], &o[2], &o[3], &o[4], &o[5]) - 1;
+        char out[200]; int len = 0;
+        for (int k = 0; k < n && a && !IsBadReadPtr((char *)a + o[k], 4); k++) len += snprintf(out + len, sizeof out - len, " +%x %.3f", o[k], *(float *)((char *)a + o[k]));
+        out[len] = 0;
+        bot_log("vpeek: %08x%s", a, out);
+    } else if (!strncmp(line, "vheat ", 6)) {   // vheat <hex weapon>: candidate heat floats (research)
+        unsigned a = 0; sscanf(line + 6, "%x", &a);
+        char *w = (char *)a, *b = w && !IsBadReadPtr(w + 0x1c4, 4) ? *(char **)(w + 0x1c4) : NULL, *b0 = w && !IsBadReadPtr(w + 0x1c0, 4) ? *(char **)(w + 0x1c0) : NULL;
+        if (b && !IsBadReadPtr(b, 0x60) && b0 && !IsBadReadPtr(b0, 0xf0))
+            bot_log("vheat: %p [1c4]+50 %.3f +54 %.3f +58 %.3f | [1c0]+ec %.3f", w, *(float *)(b + 0x50), *(float *)(b + 0x54), *(float *)(b + 0x58), *(float *)(b0 + 0xec));
+    } else if (!strncmp(line, "vrounds ", 8)) {   // vrounds <hex weapon>: its loaded rounds ([+1c4]+68, found 2026-10-15 on the Mi-28 pods)
+        unsigned a = 0; sscanf(line + 8, "%x", &a);
+        char *w = (char *)a, *b = w && !IsBadReadPtr(w + 0x1c4, 4) ? *(char **)(w + 0x1c4) : NULL;
+        bot_log("vrounds: %p -> %d", w, b && !IsBadReadPtr(b + 0x68, 4) ? *(int *)(b + 0x68) : -1);
+    } else if (!strncmp(line, "mslpos ", 7)) {
+        g_mslPosHunt = atoi(line + 7); bot_log("mslpos: %s", g_mslPosHunt ? "on" : "off");
+    } else if (!strncmp(line, "vammo ", 6)) {   // vammo <bot#>: loaded / spare rounds of each weapon on its vehicle (research)
+        int k = atoi(line + 6);
+        char *veh = k >= 0 && k < H->botCount ? player_vehicle(H->bots[k]) : NULL;
+        float *vp = veh ? vehicle_xf(veh) : NULL;
+        if (!vp) { bot_log("usage: vammo <bot# in a vehicle>"); return; }
+        CompCache *cc = &g_compCache[g_compCur];
+        for (int q = 0; q < cc->gcount; q++) {
+            char *w = cc->gun[q];
+            if (!gun_ok(w)) continue;
+            float *wp = (float *)(w + 0x60), dx = wp[0] - vp[12], dy = wp[1] - vp[13], dz = wp[2] - vp[14];
+            if (dx * dx + dy * dy + dz * dz > 15.0f * 15.0f) continue;
+            float sp, gr; const char *fx;
+            vweapon_ballistics(w, &sp, &gr, &fx);
+            int l = -1, s = -1, ok = vweapon_ammo(w, &l, &s);
+            bot_log("vammo: %p %.0f m/s %s: %s %s loaded %d spare %d", w, sp, fx ? fx : "", ok ? "found at" : "NOT FOUND", ok ? g_vammoPath : "", l, s);
+        }
     } else if (!strncmp(line, "flysign ", 8)) {
         g_flyTurnSign = (float)atof(line + 8) < 0 ? -1.0f : 1.0f;
         bot_log("fly: turn sign %.0f", g_flyTurnSign);
+    } else if (!strncmp(line, "helihold ", 9)) {   // helihold <bot#> [height] | helihold <bot#> off: hold a helicopter level at a height
+        int k = -1; float a = -1e9f; char off[8] = "";
+        if (sscanf(line + 9, "%d %7s", &k, off) == 2 && !strcmp(off, "off") && k >= 0 && k < H->botCount) {
+            g_heliHold[k] = 0; g_flying[k] = 0; g_driving[k] = 0; bot_log("helihold: %s off", (char *)H->bots[k] + OFF_PLAYER_ONLINE_NAME); return; }
+        sscanf(line + 9, "%d %f", &k, &a);
+        char *veh = k >= 0 && k < H->botCount ? player_vehicle(H->bots[k]) : NULL;
+        float *m = veh ? vehicle_xf(veh) : NULL;
+        if (!m) { bot_log("usage: helihold <bot# in a helicopter> [height] | helihold <bot#> off"); return; }
+        g_heliHold[k] = 1; g_flying[k] = 1; g_flyAuto[k] = 0;
+        g_heliAlt[k] = a > -1e8f ? a : m[13]; g_heliWantPitch[k] = g_heliWantBank[k] = 0; g_heliTrim[k] = 0;
+        g_heliLastAlt[k] = 0; g_heliVs[k] = 0; g_heliTapUntil[k] = 0; g_heliLogAt[k] = 0;
+        g_heliGo[k] = 0; g_heliLand[k] = 0; g_heliRide[k] = 0; g_heliAtk[k] = 0; g_heliAuto[k] = 0; g_heliLastXZ[k][0] = g_heliLastXZ[k][1] = 0; g_heliVel[k][0] = g_heliVel[k][1] = 0; g_heliWantHdg[k] = atan2f(m[8], m[10]) * 57.29578f;
+        bot_log("helihold: %s holds level at %.0f m", (char *)H->bots[k] + OFF_PLAYER_ONLINE_NAME, g_heliAlt[k]);
+    } else if (!strncmp(line, "heliatt ", 8)) {   // heliatt <bot#> <pitch deg> <bank deg> [height]: the attitude (and height) to hold
+        int k = -1; float pt = 0, bk = 0, a = -1e9f;
+        if (sscanf(line + 8, "%d %f %f %f", &k, &pt, &bk, &a) < 3 || k < 0 || k >= H->botCount) { bot_log("usage: heliatt <bot#> <pitch> <bank> [height]"); return; }
+        g_heliWantPitch[k] = pt; g_heliWantBank[k] = bk; if (a > -1e8f) g_heliAlt[k] = a;
+        bot_log("heliatt: %s pitch %.0f bank %.0f at %.0f m", (char *)H->bots[k] + OFF_PLAYER_ONLINE_NAME, pt, bk, g_heliAlt[k]);
+    } else if (!strncmp(line, "helitap ", 8)) {   // helitap <bot#> <roll> <yaw> <frames>: raw roll / pedal input over the hold (sign tests)
+        int k = -1, fr = 15; float r = 0, y = 0;
+        if (sscanf(line + 8, "%d %f %f %d", &k, &r, &y, &fr) < 3 || k < 0 || k >= H->botCount) { bot_log("usage: helitap <bot#> <roll> <yaw> [frames]"); return; }
+        g_heliTapRoll[k] = r; g_heliTapYaw[k] = y; g_heliTapUntil[k] = H->frame + (unsigned)fr;
+        bot_log("helitap: %s roll %.2f yaw %.2f for %d frames", (char *)H->bots[k] + OFF_PLAYER_ONLINE_NAME, r, y, fr);
+    } else if (!strncmp(line, "heligo ", 7)) {   // heligo <bot#> <x> <z> [height] | heligo <bot#> stop: fly there and hover over it
+        int k = -1; float x = 0, z = 0, a = -1e9f; char w[8] = "";
+        if (sscanf(line + 7, "%d %7s", &k, w) == 2 && !strcmp(w, "stop") && k >= 0 && k < H->botCount) {
+            char *v = player_vehicle(H->bots[k]); float *m = v ? vehicle_xf(v) : NULL;
+            if (m) { g_heliGoal[k][0] = m[12]; g_heliGoal[k][1] = m[14]; }
+            bot_log("heligo: %s stops and hovers", (char *)H->bots[k] + OFF_PLAYER_ONLINE_NAME); return; }
+        if (sscanf(line + 7, "%d %f %f %f", &k, &x, &z, &a) < 3 || k < 0 || k >= H->botCount || !g_heliHold[k]) {
+            bot_log("usage: heligo <bot# under helihold> <x> <z> [height] | heligo <bot#> stop"); return; }
+        char *v = player_vehicle(H->bots[k]); float *m = v ? vehicle_xf(v) : NULL;
+        g_heliGo[k] = 1; g_heliGoal[k][0] = x; g_heliGoal[k][1] = z; if (a > -1e8f) g_heliAlt[k] = a;
+        g_heliLand[k] = 0;   // (taking off again from a landing: the height hold lifts it)
+        if (m) g_heliWantHdg[k] = atan2f(m[8], m[10]) * 57.29578f;
+        bot_log("heligo: %s -> (%.0f, %.0f) at %.0f m, %.0f m away", (char *)H->bots[k] + OFF_PLAYER_ONLINE_NAME, x, z, g_heliAlt[k],
+                m ? sqrtf((x - m[12]) * (x - m[12]) + (z - m[14]) * (z - m[14])) : 0.0f);
+    } else if (!strncmp(line, "heliauto ", 9)) {   // heliauto <bot# under helihold> [off]: hunt on its own, open to pickups between passes
+        int k = atoi(line + 9);
+        if (k < 0 || k >= H->botCount || !g_heliHold[k]) { bot_log("usage: heliauto <bot# under helihold> [off]"); return; }
+        g_heliAuto[k] = !strstr(line + 9, "off");
+        if (!g_heliAuto[k]) g_heliAtk[k] = 0;
+        else { g_heliAtkNW[k] = 0; heli_find_pods(k, player_vehicle(H->bots[k])); }
+        bot_log("heliauto: %s %s", (char *)H->bots[k] + OFF_PLAYER_ONLINE_NAME, g_heliAuto[k] ? "hunts on its own" : "off");
+    } else if (!strncmp(line, "heliatkmgpitch ", 15)) {   // heliatkmgpitch <deg>: the minigun's aim trim (- = lower)
+        g_heliMgPitch = (float)atof(line + 15); bot_log("heliatkmgpitch: %.1f deg", g_heliMgPitch);
+    } else if (!strncmp(line, "heliatkyaw ", 11)) {   // heliatkyaw <deg>: trim the run's aim heading (+ right, - left)
+        g_heliAtkYaw = (float)atof(line + 11); bot_log("heliatkyaw: %.1f deg", g_heliAtkYaw);
+    } else if (!strncmp(line, "heliatkmg ", 10)) {   // heliatkmg <height> <range> <open fire> <break>: a minigun's strafing run
+        sscanf(line + 10, "%f %f %f %f", &g_heliMgH, &g_heliMgR, &g_heliMgFire, &g_heliMgBrk);
+        bot_log("heliatkmg: %.0f m up, set-up %.0f m out, fire from %.0f m, break at %.0f m", g_heliMgH, g_heliMgR, g_heliMgFire, g_heliMgBrk);
+    } else if (!strncmp(line, "heliatkcfg ", 11)) {   // heliatkcfg <height over the target> <range>: the strafing run's set-up
+        sscanf(line + 11, "%f %f", &g_heliAtkH, &g_heliAtkR);
+        bot_log("heliatkcfg: set-up %.0f m up, %.0f m out (a %.0f degree dive)", g_heliAtkH, g_heliAtkR, atan2f(g_heliAtkH, g_heliAtkR) * 57.29578f);
+    } else if (!strncmp(line, "heliattack ", 11)) {   // heliattack <bot# under helihold> <player> | <bot#> off: strafing runs on them
+        int k = -1; char who[64] = "";
+        if (sscanf(line + 11, "%d %63[^\n]", &k, who) < 2 || k < 0 || k >= H->botCount || !g_heliHold[k]) { bot_log("usage: heliattack <bot# under helihold> <player> | off"); return; }
+        if (!strcmp(who, "off")) { g_heliAtk[k] = 0; g_heliGo[k] = 0; bot_log("heliattack: %s stops - hovers", (char *)H->bots[k] + OFF_PLAYER_ONLINE_NAME); return; }
+        char *t = find_player(who);
+        if (!t) { bot_log("heliattack: no player '%s'", who); return; }
+        g_heliAtkTgt[k] = t; g_heliAtk[k] = 1; g_heliRide[k] = 0; g_heliPlanned[k] = 0;
+        heli_find_pods(k, player_vehicle(H->bots[k]));
+        memset(g_heliAtkLast[k], 0, sizeof g_heliAtkLast[k]); memset(g_heliAtkVel[k], 0, sizeof g_heliAtkVel[k]);
+        bot_log("heliattack: %s goes after %s", (char *)H->bots[k] + OFF_PLAYER_ONLINE_NAME, t + OFF_PLAYER_ONLINE_NAME);
+    } else if (!strncmp(line, "heliland ", 9)) {   // heliland <bot#> <x> <z>: fly over the spot and land on it
+        int k = -1; float x = 0, z = 0;
+        if (sscanf(line + 9, "%d %f %f", &k, &x, &z) < 3 || k < 0 || k >= H->botCount || !g_heliHold[k]) { bot_log("usage: heliland <bot# under helihold> <x> <z>"); return; }
+        char *v = player_vehicle(H->bots[k]); float *m = v ? vehicle_xf(v) : NULL;
+        g_heliGo[k] = 1; g_heliGoal[k][0] = x; g_heliGoal[k][1] = z; g_heliLand[k] = 1; g_heliLandAt[k] = H->frame; g_heliShift[k] = 0;
+        if (m) g_heliAlt[k] = m[13];   // (at the height it is: over the spot first)
+        bot_log("heliland: %s -> lands at (%.0f, %.0f)", (char *)H->bots[k] + OFF_PLAYER_ONLINE_NAME, x, z);
+    } else if (!strncmp(line, "aalead ", 7)) {   // aalead <x>: the AA guns' lead multiplier
+        g_aaLeadMul = (float)atof(line + 7);
+        bot_log("aalead: %.2f", g_aaLeadMul);
+    } else if (!strncmp(line, "helispeed ", 10)) {   // helispeed <m/s>: top speed for heligo
+        g_heliMaxSpeed = (float)atof(line + 10);
+        bot_log("helispeed: %.0f m/s", g_heliMaxSpeed);
+    } else if (!strncmp(line, "heliroll ", 9)) {   // heliroll <1|-1|0>: the roll stick's sign (0: roll not held)
+        g_heliRollSign = atoi(line + 9);
+        bot_log("heliroll: roll stick sign %d", g_heliRollSign);
     } else if (!strncmp(line, "flytest ", 8)) {
         int k = -1, fr = 30; float r = 0, pt = 0, th = 0, yw = 0; char off[8] = "";
         if (sscanf(line + 8, "%d %7s", &k, off) == 2 && !strcmp(off, "off") && k >= 0 && k < H->botCount) {
@@ -8598,6 +8889,12 @@ static void gunner_pick_target(int i, const float *gp)
         char **avs, *bv = NULL;
         int nav = vehicle_list(&avs);
         float bd = AA_RANGE;
+        // its own half of the map only (the user, 2026-10-14: it shot helicopters lifting off from the enemy's spawn): the
+        // middle is the middle of the flags (as the jets' dive set-up finds it); a target counts while it is on the gun's side
+        float mx = 0, mz = 0;
+        for (int k = 0; k < g_flagCount; k++) { mx += flag_pos(k)[0]; mz += flag_pos(k)[2]; }
+        if (g_flagCount) { mx /= g_flagCount; mz /= g_flagCount; }
+        float sx = gp[0] - mx, sz = gp[2] - mz;   // from the middle towards the gun
         for (int k = 0; k < nav; k++) {
             char *v = avs[k];
             int vteam = 0;
@@ -8606,6 +8903,7 @@ static void gunner_pick_target(int i, const float *gp)
             if (kd != VK_JET && kd != VK_HELI) continue;
             float *tp = vehicle_pos(v, &vteam);
             if (!tp || !vteam || vteam == team || *(float *)(v + OFF_VEHICLE_HEALTH) <= 0 || !vehicle_occupied(v)) continue;
+            if (g_flagCount && (tp[0] - mx) * sx + (tp[2] - mz) * sz <= 0) continue;   // past the middle: the enemy's half
             float d = sqrtf(dist2(tp, gp) + (tp[1] - gp[1]) * (tp[1] - gp[1]));
             float aim[3] = {tp[0], tp[1] + 1.0f, tp[2]};
             if (d >= bd || !gun_can_see(gp, aim, 1)) continue;
@@ -8756,7 +9054,11 @@ static void gunner_tick(int i)
     {   // lead a moving target by the shot's flight time; a slow shell (a tank's 200 m/s) also needs holding over for its drop
         float lp[3], ddx = tp[0] - gp[0], ddz = tp[2] - gp[2], hd = sqrtf(ddx * ddx + ddz * ddz);
         float sp = aSpeed > 20.0f ? aSpeed : BULLET_SPEED;
+        int kd = isVeh ? vehicle_kind(g_gunTargetVeh[i]) : 0;
+        g_leadAir = kd == VK_JET || kd == VK_HELI;
         lead_point(i, isVeh ? (void *)g_gunTargetVeh[i] : (void *)g_gunTarget[i], tp, hd * (BULLET_SPEED / sp), lp);
+        if (g_leadAir) aim[1] += lp[1] - tp[1];
+        g_leadAir = 0;
         aim[0] = lp[0]; aim[2] = lp[2];
         if (aGrav < 0 && aSpeed > 20.0f) { float t = hd / sp; aim[1] += 0.5f * -aGrav * t * t; }
     }
@@ -9743,7 +10045,23 @@ static int vehicle_nation(char *v)
     }
     return 0;
 }
-static int pilot_ride_kind(int k) { return k == VK_TANK || k == VK_IFV || k == VK_JET; }
+static int pilot_ride_kind(int k) { return k == VK_TANK || k == VK_IFV || k == VK_JET || k == VK_HELI; }   // (helicopters: 2026-10-15)
+static int ride_is_air(int k) { return k == VK_JET || k == VK_HELI; }
+static unsigned g_airTakenAt[3][2];
+// Ride categories, in the order of a tie (the user, 2026-10-15: the biggest seating first at the start of a round, then the
+// types in turn): 0 IFV, 1 tank | 2 transport helicopter, 3 jet, 4 attack helicopter / Littlebird. g_catTakenAt: per team,
+// when a Pilot last went for one (stamped as it heads for it - two Pilots both took jets while the first was still walking)
+static int ride_cat(char *v)
+{
+    int k = vehicle_kind(v);
+    if (k == VK_IFV) return 0;
+    if (k == VK_TANK) return 1;
+    if (k == VK_JET) return 3;
+    if (k == VK_HELI) { char **b; return vehicle_seats(v, &b) >= 4 ? 2 : 4; }   // (4+ seats: a transport - the Littlebird too)
+    return -1;
+}   // per team: when a Pilot last took a jet [0] / a helicopter [1] - the type least recently flown next
+static int pilot_wants_air(int i);
+static void heli_take(int i, char *v, const char *why);
 static int vehicle_is_mobile_aa(char *v)   // LAV-AD / 9K22 Tunguska-M / Vodnik AA: a Pilot's last pick before a taxi (the user)
 {
     const char *n0 = vehicle_name(v);
@@ -9769,7 +10087,7 @@ static int pilot_has_rides(int i)
 #define PILOT_PICKUP_RADIUS 150.0f
 // A jet nobody has taken for 60 s: the next Pilot needing a ride walks to it first, however far (the user, 2026-10-13)
 static char *g_jetIdle[32];
-static unsigned g_jetIdleSince[32];
+static unsigned g_jetIdleSince[32], g_jetIdleFrom;   // (no jet's idle clock starts before g_jetIdleFrom: a minute into the round)
 static unsigned jet_idle_frames(char *v)
 {
     int slot = -1;
@@ -9777,9 +10095,9 @@ static unsigned jet_idle_frames(char *v)
     if (slot < 0) {
         for (int k = 0; k < 32; k++) if (!g_jetIdle[k] || !vehicle_ok(g_jetIdle[k]) || !driver_seat_free(g_jetIdle[k])) { slot = k; break; }
         if (slot < 0) return 0;
-        g_jetIdle[slot] = v; g_jetIdleSince[slot] = H->frame;
+        g_jetIdle[slot] = v; g_jetIdleSince[slot] = (int)(g_jetIdleFrom - H->frame) > 0 ? g_jetIdleFrom : H->frame;
     }
-    return H->frame - g_jetIdleSince[slot];
+    return (int)(H->frame - g_jetIdleSince[slot]) > 0 ? H->frame - g_jetIdleSince[slot] : 0;
 }
 // Last time a jet of each side was seen in the air (anyone's: a human's counts) - with none up for 60 s a Pilot that is
 // due to respawn spawns straight into a jet (the user, 2026-10-13: carrier maps never had bot jets up). 0 = never.
@@ -9790,7 +10108,13 @@ static void jet_idle_tick(void)   // free jets keep their clock; a taken / destr
     {
         NavGrid *gg = *nav_slot();
         unsigned ser = gg ? gg->serial : 0;
-        if (ser != g_jetUpLevelSerial) { g_jetUpLevelSerial = ser; g_jetUpAt[1] = g_jetUpAt[2] = H->frame - 61 * 30; }   // (a new map: none up yet)
+        if (ser != g_jetUpLevelSerial) {   // a new map: both 60 s clocks start after the round's first minute (the user, 2026-10-15:
+            g_jetUpLevelSerial = ser;       // Pilots were in the jets before the humans had loaded in)
+            g_jetUpAt[1] = g_jetUpAt[2] = H->frame + 60 * 30;
+            for (int k = 0; k < 32; k++) g_jetIdle[k] = NULL;
+            memset(g_catTakenAt, 0, sizeof g_catTakenAt);   // (a new round: the biggest seating first again)
+            g_jetIdleFrom = H->frame + 60 * 30;
+        }
         char **vs;
         int nv = vehicle_list(&vs);
         unsigned saved = g_rayFlags;
@@ -9811,7 +10135,7 @@ static void jet_idle_tick(void)   // free jets keep their clock; a taken / destr
         if (g_jetIdle[k] && (!vehicle_ok(g_jetIdle[k]) || !driver_seat_free(g_jetIdle[k]))) g_jetIdle[k] = NULL;
     char **vs;
     int nv = vehicle_list(&vs);
-    for (int k = 0; k < nv; k++) if (vehicle_ok(vs[k]) && vehicle_kind(vs[k]) == VK_JET && driver_seat_free(vs[k])) jet_idle_frames(vs[k]);
+    for (int k = 0; k < nv; k++) if (vehicle_ok(vs[k]) && ride_is_air(vehicle_kind(vs[k])) && driver_seat_free(vs[k])) jet_idle_frames(vs[k]);   // (helicopters too)
 }
 static unsigned char g_pilotWaiting[MAX_BOTS];
 static char *g_pilotRide[MAX_BOTS];      // the vehicle a Pilot on foot is heading for
@@ -9904,9 +10228,55 @@ static int pilot_ride_ours(char *v, int team)
     if (nat) return nat == team;
     return vehicle_ours_side(v, team);
 }
+// Ground and air in turn (the user, 2026-10-15): a Pilot picking a ride goes for whichever of armour / aircraft its team's
+// Pilots have fewer of (in one or on their way to one); a tie: armour.
+static int pilot_side_counts(int i, int *ground, int *air);
+static int pilot_wants_air(int i)
+{
+    int team = player_team(H->bots[i]), ground = 0, air = 0;
+    for (int j = 0; j < H->botCount; j++) {
+        if (j == i || player_team(H->bots[j]) != team || !is_pilot(j)) continue;
+        char *v = player_vehicle(H->bots[j]);
+        if (!v) v = g_pilotRide[j];
+        if (!v || !vehicle_ok(v)) continue;
+        int k = vehicle_kind(v);
+        if (ride_is_air(k)) air++; else if (k == VK_TANK || k == VK_IFV) ground++;
+    }
+    return air < ground;
+}
+static int pilot_side_counts(int i, int *ground, int *air)
+{
+    int team = player_team(H->bots[i]);
+    *ground = *air = 0;
+    for (int j = 0; j < H->botCount; j++) {
+        if (j == i || player_team(H->bots[j]) != team || !is_pilot(j)) continue;
+        char *v = player_vehicle(H->bots[j]);
+        if (!v) v = g_pilotRide[j];
+        if (!v || !vehicle_ok(v)) continue;
+        int k = vehicle_kind(v);
+        if (ride_is_air(k)) (*air)++; else if (k == VK_TANK || k == VK_IFV) (*ground)++;
+    }
+    return 0;
+}
+// A Pilot in a helicopter flies it with the helicopter controller: few seats (attack / Littlebird) - it hunts on its own;
+// 4+ free seats (a transport) - it holds and takes "Need pickup" calls from the ride board.
+static void heli_take(int i, char *v, const char *why)
+{
+    char cmd[40];
+    snprintf(cmd, sizeof cmd, "helihold %d", i); botmod_command(cmd);
+    int transport = free_seat_count(v) >= 4;
+    if (!transport) { snprintf(cmd, sizeof cmd, "heliauto %d", i); botmod_command(cmd); }
+    int team = player_team(H->bots[i]);
+    if (team == 1 || team == 2) g_airTakenAt[team][1] = H->frame ? H->frame : 1;
+    bot_log("pilot: %s %s the %s - %s", (char *)H->bots[i] + OFF_PLAYER_ONLINE_NAME, why, vehicle_name(v), transport ? "a transport: answers pickups" : "hunts on its own");
+}
 static void pilot_pickup_tick(int i)
 {
     char *pl = H->bots[i], *s = *(char **)(pl + OFF_PLAYER_SOLDIER);
+    if (g_heliHold[i] && (!s || !player_vehicle(pl) || vehicle_kind(player_vehicle(pl)) != VK_HELI)) {   // out of its helicopter: all off
+        g_heliHold[i] = 0; g_heliAuto[i] = 0; g_heliAtk[i] = 0; g_heliRide[i] = 0; g_heliGo[i] = 0; g_heliLand[i] = 0;
+        g_flying[i] = 0; g_driving[i] = 0;
+    }
     if (!s || player_vehicle(pl) || !is_pilot(i)) g_pilotWaiting[i] = 0;
     if (s && is_pilot(i) && player_vehicle(pl) && !g_drive[i].phase && !g_flying[i] && g_driving[i] >= 0) {   // at the controls with no plan
         char *v = player_vehicle(pl);                                                                          // (a core reload): carry on
@@ -9915,6 +10285,13 @@ static void pilot_pickup_tick(int i)
         if (nat && nat != player_team(pl)) {   // sitting in the other side's vehicle: respawn properly
             bot_log("pilot: %s is in the other side's %s - killed to respawn", pl + OFF_PLAYER_ONLINE_NAME, vehicle_name(v));
             kill_bot(pl);
+            return;
+        }
+        if (vehicle_kind(v) == VK_HELI) {   // a helicopter: brain off = console tests (hold only - after a core reload it fell out of a
+            if (!g_heliHold[i]) {           // 260 m hover while the hold was re-typed, 2026-10-15); a Pilot flies it (heli_take)
+                if (bot_brain(i)->enabled) heli_take(i, v, "carries on in");
+                else { char cmd[32]; snprintf(cmd, sizeof cmd, "helihold %d", i); botmod_command(cmd); }
+            }
             return;
         }
         if (!pilot_ride_any(vehicle_kind(v))) {   // a helicopter / gun it cannot work: out, on foot (one sat in an AH-6)
@@ -10032,7 +10409,9 @@ static void pilot_pickup_tick(int i)
                     g_pilotRide[i] = NULL;
                     bot_nav(i)->mode = 0;
                     H->botMove[i][0] = H->botMove[i][1] = H->botMove[i][2] = 0;
+                    if (vehicle_kind(r) == VK_HELI) { heli_take(i, r, "takes"); return; }
                     if (vehicle_kind(r) == VK_JET) {
+                        if (team == 1 || team == 2) g_airTakenAt[team][0] = H->frame ? H->frame : 1;
                         g_driving[i] = 1; g_flying[i] = 1; g_flyAuto[i] = 1; g_flyCircuit[i] = 1; g_flyOrbit[i] = -1; g_flyChase[i] = NULL; g_flySeek[i] = 0;
                         g_flyFlag[i] = -1; g_flyLogAt[i] = 0; g_flyAglAt[i] = 0; g_flyTakeoff[i] = 1; g_flyTakeoffAlt[i] = 0;
                         bot_log("pilot: %s is in the %s - take-off", pl + OFF_PLAYER_ONLINE_NAME, vehicle_name(r));
@@ -10058,6 +10437,12 @@ static void pilot_pickup_tick(int i)
     int nv = vehicle_list(&vehs);
     float bestD = 1e30f, lightD = 150.0f * 150.0f;
     int idleJet = 0;
+    char *clsV[RIDE_CATS] = {NULL, NULL, NULL, NULL, NULL}, *idleV = NULL, *sideV[2] = {NULL, NULL};
+    int sideSeats[2] = {0, 0}, sideCat[2] = {0, 0};
+    float sideD[2] = {1e30f, 1e30f};
+    unsigned idleF = 0;
+    float idleD = 1e30f;
+    float clsD[RIDE_CATS] = {1e30f, 1e30f, 1e30f, 1e30f, 1e30f};
     char *light = NULL;   // a jeep / boat near it: the taxi, when no armour / jet is free (the user, 2026-10-13)
     char *aa = NULL;      // a mobile AA truck: only when no tank / IFV / jet is free - before a taxi (the user, 2026-10-13)
     float aaD = 1e30f;
@@ -10087,15 +10472,43 @@ static void pilot_pickup_tick(int i)
             if (ld < lightD) { lightD = ld; light = v; }
             continue;
         }
-        int idle = vehicle_kind(v) == VK_JET && jet_idle_frames(v) > 60 * 30;   // an idle jet first, at any distance
-        if (idleJet && !idle) continue;
         int taken = 0;
         for (int j = 0; j < H->botCount && !taken; j++) if (j != i && ((g_drive[j].phase && g_drive[j].veh == v) || g_pilotRide[j] == v)) taken = 1;
         if (taken) continue;
         float *vp = vehicle_pos(v, NULL);
         float d = vp ? dist2(vp, me) : 1e30f;
-        if (idle && !idleJet) { idleJet = 1; bestD = 1e30f; }
-        if (d < bestD) { bestD = d; best = v; }
+        int cat = ride_cat(v);
+        if (cat >= 0 && d < clsD[cat]) { clsD[cat] = d; clsV[cat] = v; }
+        if (cat >= 0) {   // the best of each side: the most seats, then the type least recently picked, then the nearest
+            char **sb;
+            int side = ride_is_air(vehicle_kind(v)), seats = vehicle_seats(v, &sb), t0 = team == 1 || team == 2 ? team : 1;
+            int better = !sideV[side] || seats > sideSeats[side] ||
+                         (seats == sideSeats[side] && (g_catTakenAt[t0][cat] < g_catTakenAt[t0][sideCat[side]] ||
+                                                       (g_catTakenAt[t0][cat] == g_catTakenAt[t0][sideCat[side]] && d < sideD[side])));
+            if (better) { sideV[side] = v; sideSeats[side] = seats; sideCat[side] = cat; sideD[side] = d; }
+        }
+        if (ride_is_air(vehicle_kind(v))) { unsigned idf = jet_idle_frames(v); if (idf > 60 * 30 && idf > idleF) { idleF = idf; idleV = v; idleD = d; } }
+    }
+    if (idleV) {   // an aircraft of ours nobody has taken for 60 s (the user: the jets never died, the helicopters sat at the HQ all
+        // game while tank after tank went out): it, before the turn
+        best = idleV; bestD = idleD;
+        int ic = ride_cat(idleV), t = team == 1 || team == 2 ? team : 1;
+        if (ic >= 0) g_catTakenAt[t][ic] = H->frame ? H->frame : 1;
+        bot_log("pilot: %s - the %s has stood unused for %.0f s: takes it", pl + OFF_PLAYER_ONLINE_NAME, vehicle_name(idleV), idleF / 30.0f);
+    } else
+    {   // armour or aircraft in turn (the side its team's Pilots have fewer of; a tie - the round's start - the side whose best
+        // free vehicle seats more); on that side the most seats first, then the type least recently picked (the user,
+        // 2026-10-15: the highest occupancy out of the base first, so "Get in!" is worth it)
+        int ground = 0, air = 0, t = team == 1 || team == 2 ? team : 1;
+        pilot_side_counts(i, &ground, &air);
+        int side = air < ground ? 1 : ground < air ? 0 : (sideSeats[1] > sideSeats[0] ? 1 : 0);
+        if (!sideV[side]) side = !side;
+        if (sideV[side]) {
+            best = sideV[side]; bestD = sideD[side]; g_catTakenAt[t][sideCat[side]] = H->frame ? H->frame : 1;
+            static const char *cn[RIDE_CATS] = {"an IFV", "a tank", "a transport helicopter", "a jet", "an attack helicopter"};
+            bot_log("pilot: %s - its team has %d in armour, %d in aircraft: %s (%s, %d seats)", pl + OFF_PLAYER_ONLINE_NAME, ground, air, cn[sideCat[side]],
+                    vehicle_name(best), sideSeats[side]);
+        }
     }
     if (!best && aa) { best = aa; bestD = aaD; }
     if (!best && light) { best = light; bestD = lightD; }
@@ -10289,7 +10702,13 @@ static int drive_pickup(int i, DriveState *d, const float *vp)
     char *pl = H->bots[i];
     int boarding = 0;
     for (int j = 0; j < H->botCount; j++) if (j != i && g_drive[j].phase == 5 && g_drive[j].veh == d->veh) boarding++;
+    static int seats0[MAX_BOTS];
+    static unsigned char filled[MAX_BOTS];
     if (d->pickupUntil) {
+        if (!filled[i] && free_seat_count(d->veh) < seats0[i]) {   // the first seat taken: 5 s more for the rest (the user)
+            filled[i] = 1;
+            if (d->pickupUntil > H->frame + 5 * 30) d->pickupUntil = H->frame + 5 * 30;
+        }
         if (boarding && H->frame < d->pickupUntil) return 1;
         bot_log("drive: %s drives on (%s)", pl + OFF_PLAYER_ONLINE_NAME, boarding ? "waited long enough" : "everyone is in");
         d->pickupUntil = 0;
@@ -10305,6 +10724,7 @@ static int drive_pickup(int i, DriveState *d, const float *vp)
         BotBrain *b = bot_brain(j);
         if (j == i || !js || player_team(jp) != team || player_vehicle(jp) || g_drive[j].phase || !b->enabled) continue;
         if (b->task != TASK_NONE || g_fightTarget[j] || H->frame - g_askedAt[j] < 60 * 30) continue;
+        if (g_dropAt[j] && H->frame - g_dropAt[j] < 60 * 30) continue;
         float *jpos = (float *)(js + OFF_SOLDIER_POSITION);
         if (dist2(jpos, vp) > 25.0f * 25.0f) continue;
         g_askedAt[j] = H->frame;
@@ -10328,7 +10748,8 @@ static int drive_pickup(int i, DriveState *d, const float *vp)
         yes++;
     }
     if (!yes) return 0;
-    d->pickupUntil = H->frame + 15 * 30;
+    d->pickupUntil = H->frame + 15 * 30;   // nobody in by then: on its way
+    seats0[i] = free_seat_count(d->veh); filled[i] = 0;
     bot_log("drive: %s stops to pick up %d bot(s)", pl + OFF_PLAYER_ONLINE_NAME, yes);
     return 1;
 }
@@ -10385,6 +10806,545 @@ static void drive_consider(int i)
 #define PILOT_REPAIR_BELOW_FRAC  0.5f
 #define PILOT_REPAIRED_FRAC      0.75f
 static float *vehicle_xf(char *veh);
+// ---- Helicopters (2026-10-14, first steps): a hold mode for measuring and the first controller layers. Measured on a
+// Venom: throttle + = collective up (~16 m/s climb at full), 0 = about a hover when level; pitch stick + = nose DOWN and it
+// is a RATE (the attitude stays where it is left - nothing levels it); tilted with neutral collective it trades lift for
+// speed and sinks (the user: "horizontal lift takes away vertical" - collective up whenever it moves).
+// Layers: collective holds a height (vertical-speed loop + a learned trim + a tilt term); the sticks hold a wanted pitch /
+// bank (rate sticks: every frame, never let go); the wanted attitude will come from a wanted velocity (later).
+static int vweapon_rounds(char *w)
+{
+    char *b = w && !IsBadReadPtr(w + 0x1c4, 4) ? *(char **)(w + 0x1c4) : NULL;
+    if (!b || (unsigned)b < 0x10000u || IsBadReadPtr(b + 0x68, 4)) return -1;
+    int r = *(int *)(b + 0x68);
+    return r >= 0 && r <= 1000 ? r : -1;
+}
+static void heli_find_pods(int i, char *veh)   // fixed forward weapons at rocket speed (the nose's): candidates for the pilot's pod
+{
+    float *vp = vehicle_xf(veh);
+    g_heliAtkNW[i] = 0; g_heliAtkPod[i] = -1;
+    if (!vp) return;
+    CompCache *cc = &g_compCache[g_compCur];
+    for (int q = 0; q < cc->gcount && g_heliAtkNW[i] < 4; q++) {
+        char *w = cc->gun[q];
+        if (!gun_ok(w)) continue;
+        float *wp = (float *)(w + 0x60), *f = (float *)(w + 0x50), dx = wp[0] - vp[12], dy = wp[1] - vp[13], dz = wp[2] - vp[14];
+        if (dx * dx + dy * dy + dz * dz > 12.0f * 12.0f || f[0] * vp[8] + f[1] * vp[9] + f[2] * vp[10] < 0.98f) continue;
+        float sp, gr; const char *fx;
+        if (!vweapon_ballistics(w, &sp, &gr, &fx) || !fx) continue;
+        int mg = strstr(fx, "Minigun") != NULL, rk = strstr(fx, "ThinSmoke_ShortLived") != NULL && vweapon_rounds(w) > 0;
+        if (!mg && !rk) continue;
+        int n = g_heliAtkNW[i];
+        g_heliAtkW[i][n] = w; g_heliAtkFull[i][n] = rk ? vweapon_rounds(w) : 0; g_heliAtkSpd[i][n] = sp; g_heliAtkHeat[i][n] = (unsigned char)mg;
+        g_heliAtkNW[i]++;
+        bot_log("heliattack: %s - candidate %p: %s, %.0f m/s", (char *)H->bots[i] + OFF_PLAYER_ONLINE_NAME, w, mg ? "minigun (heat)" : "rocket pod (rounds)", sp);
+    }
+}
+static float vweapon_heat(char *w)   // a minigun's heat 0..1 (-1 unknown)
+{
+    char *b = w && !IsBadReadPtr(w + 0x1c4, 4) ? *(char **)(w + 0x1c4) : NULL;
+    if (!b || (unsigned)b < 0x10000u || IsBadReadPtr(b + 0x78, 4)) return -1;
+    float h = *(float *)(b + 0x78);
+    return h >= 0.0f && h <= 1.5f ? h : -1;
+}
+static int heli_pod_rounds(int i)   // 0 = dry (no rockets / overheated), 1 = some left, 2 = full / cold (ready); -1 unknown
+{                                   // - learns which candidate is the trigger's from the one that counts down / heats up
+    if (g_heliAtkPod[i] < 0)
+        for (int k = 0; k < g_heliAtkNW[i]; k++) {
+            char *w = g_heliAtkW[i][k];
+            if (g_heliAtkHeat[i][k] ? vweapon_heat(w) > 0.05f : (vweapon_rounds(w) >= 0 && vweapon_rounds(w) < g_heliAtkFull[i][k])) g_heliAtkPod[i] = k;
+        }
+    int k = g_heliAtkPod[i];
+    if (k < 0) return -1;
+    if (g_heliAtkHeat[i][k]) { float h = vweapon_heat(g_heliAtkW[i][k]); return h < 0 ? -1 : h >= 0.95f ? 0 : h <= 0.05f ? 2 : 1; }
+    int r = vweapon_rounds(g_heliAtkW[i][k]);
+    return r < 0 ? -1 : r == 0 ? 0 : r >= g_heliAtkFull[i][k] ? 2 : 1;
+}
+static float heli_gun_speed(int i)   // the trigger's projectile speed (before it is known: the first candidate's)
+{
+    int k = g_heliAtkPod[i] >= 0 ? g_heliAtkPod[i] : 0;
+    return g_heliAtkNW[i] ? g_heliAtkSpd[i][k] : HELI_RKT_SPEED;
+}
+static int heli_seg_clear(const float *a, const float *b)
+{
+    float aa[3] = {a[0], a[1], a[2]}, bb[3] = {b[0], b[1], b[2]}, h[3];
+    unsigned s = g_rayFlags;
+    g_rayFlags = RAY_DONT_CHECK_CHARACTER;
+    int hit = ray_cast(aa, bb, h, NULL);
+    g_rayFlags = s;
+    return !hit;
+}
+static int heli_plan(int i, const float *T, float aH, float aR, const float *hp, float brk)
+{
+    float y = T[1] + aH, best = 1e30f, bD0 = 0, bD1 = 0, bIn = aR, bOut = 0;
+    int bSide = 1, found = 0, bDirect = 0;
+    float dxh = T[0] - hp[0], dzh = T[2] - hp[2], dh = sqrtf(dxh * dxh + dzh * dzh) + 1e-3f;
+    // as it is (the user, 2026-10-15: lined up after its turn, it flew off to the full run-in start and came back): already
+    // flying at it, between the break + 60 m and the range, on a clear line - that, now
+    float vx = g_heliVel[i][0], vz = g_heliVel[i][1], vl = sqrtf(vx * vx + vz * vz) + 1e-3f;
+    int aligned = !g_heliNoOnIt[i] && vl > 5.0f && (vx * dxh + vz * dzh) / (vl * dh) > 0.85f && dh > brk + 60.0f && dh < aR + 60.0f;
+    for (int shrink = 0; shrink < 3 && !found; shrink++) {
+        float Lin0 = aR * (shrink == 0 ? 1.0f : shrink == 1 ? 0.75f : 0.55f), Lout = fmaxf(150.0f, Lin0);
+        for (int k = aligned && !shrink ? -2 : -1; k < 24; k++) {
+            float Lin = k == -2 ? dh : Lin0;
+            float a = k < 0 ? atan2f(dxh / dh, dzh / dh) : k * 0.2617994f, d0 = sinf(a), d1 = cosf(a), p0 = d1, p1 = -d0;   // (p: +90 deg)
+            float S[3] = {T[0] - d0 * Lin, y, T[2] - d1 * Lin}, E[3] = {T[0] + d0 * Lout, y, T[2] + d1 * Lout};
+            float F[3] = {T[0] - d0 * Lin * 0.8f, y, T[2] - d1 * Lin * 0.8f}, Tt[3] = {T[0], T[1] + 1.0f, T[2]};
+            if (!heli_seg_clear(S, E) || !heli_seg_clear(F, Tt)) continue;
+            float EL[3] = {E[0] + p0 * 100.0f, y, E[2] + p1 * 100.0f}, ER[3] = {E[0] - p0 * 100.0f, y, E[2] - p1 * 100.0f};
+            float SL[3] = {S[0] + p0 * 100.0f, y, S[2] + p1 * 100.0f}, SR[3] = {S[0] - p0 * 100.0f, y, S[2] - p1 * 100.0f};
+            int side = heli_seg_clear(E, EL) ? 1 : heli_seg_clear(E, ER) ? -1 : 0;
+            if (!side || (!heli_seg_clear(S, SL) && !heli_seg_clear(S, SR))) continue;
+            float tx = S[0] - hp[0], tz = S[2] - hp[2], cost = sqrtf(tx * tx + tz * tz) / 30.0f + shrink * 10.0f - (k < 0 ? 5.0f : 0.0f) - (k == -2 ? 100.0f : 0.0f);
+            if (cost < best) { best = cost; bD0 = d0; bD1 = d1; bIn = Lin; bOut = Lout; bSide = side; found = 1; bDirect = k < 0 ? (k == -2 ? 2 : 1) : 0; }
+        }
+    }
+    g_heliNoOnIt[i] = 0;
+    if (!found) return 0;
+    g_heliPlanD[i][0] = bD0; g_heliPlanD[i][1] = bD1; g_heliPlanIn[i] = bIn; g_heliPlanOut[i] = bOut; g_heliPlanSide[i] = (signed char)bSide;
+    memcpy(g_heliPlanT[i], T, 12); g_heliPlanned[i] = 1; g_heliPlanKind[i] = (unsigned char)bDirect;
+    bot_log("heliattack: %s plans the pass: %s heading %.0f deg, run-in %.0f m, through %.0f m, turns %s (%.0f s to the start)",
+            (char *)H->bots[i] + OFF_PLAYER_ONLINE_NAME, bDirect == 2 ? "on it already," : bDirect ? "straight in," : "a better line,", atan2f(bD0, bD1) * 57.29578f, bIn, bOut,
+            bSide > 0 ? "one way" : "the other", best + (bDirect == 2 ? 105.0f : bDirect ? 5.0f : 0.0f));
+    return 1;
+}
+static void heli_tick(int i, char *veh)
+{
+    char *pl = H->bots[i];
+    float *m = vehicle_xf(veh);
+    if (!m) return;
+    heli_ride_tick(i, veh);
+    heli_auto_tick(i, veh);
+    if (g_heliAtk[i]) rkt_tick();
+    float pitch = asinf(fmaxf(-1.0f, fminf(1.0f, m[9]))) * 57.29578f, bank = atan2f(m[1], m[5]) * 57.29578f;
+    float hdg = atan2f(m[8], m[10]) * 57.29578f, alt = m[13];
+    if (!g_heliLastAlt[i]) { g_heliLastAlt[i] = alt; g_heliLastPitch[i] = pitch; g_heliLastBank[i] = bank; }
+    float vsNow = (alt - g_heliLastAlt[i]) * 30.0f;
+    g_heliVs[i] = 0.85f * g_heliVs[i] + 0.15f * vsNow;
+    float pRate = (pitch - g_heliLastPitch[i]) * 30.0f, bRate = (bank - g_heliLastBank[i]) * 30.0f;
+    g_heliLastAlt[i] = alt; g_heliLastPitch[i] = pitch; g_heliLastBank[i] = bank;
+    // horizontal velocity (the live physics transform: every frame)
+    if (!g_heliLastXZ[i][0] && !g_heliLastXZ[i][1]) { g_heliLastXZ[i][0] = m[12]; g_heliLastXZ[i][1] = m[14]; }
+    g_heliVel[i][0] = 0.8f * g_heliVel[i][0] + 0.2f * (m[12] - g_heliLastXZ[i][0]) * 30.0f;
+    g_heliVel[i][1] = 0.8f * g_heliVel[i][1] + 0.2f * (m[14] - g_heliLastXZ[i][1]) * 30.0f;
+    g_heliLastXZ[i][0] = m[12]; g_heliLastXZ[i][1] = m[14];
+    if (g_heliLand[i] || (H->frame + (unsigned)i) % 6 == 0) {
+        // (from 1 m under its centre and past the rotor tips - a Venom's rotor is ~7.5 m: rays from rotor height 8 m out hit
+        // its own blades and read 0 m at 32 m up, 2026-10-14 - ahead and to the sides, not back along the tail boom)
+        float hl0 = sqrtf(m[8] * m[8] + m[10] * m[10]) + 1e-6f, fx0 = m[8] / hl0, fz0 = m[10] / hl0, best = -1e9f, low = 1e9f;
+        static const float offs[5][2] = {{10, 0}, {7, 7}, {7, -7}, {0, 10}, {0, -10}};   // (forward, right)
+        int hits = 0;
+        for (int k = 0; k < 5; k++) {
+            float of = offs[k][0], orr = offs[k][1];
+            float ox = fx0 * of + fz0 * orr, oz = fz0 * of - fx0 * orr;
+            float a3[3] = {m[12] + ox, alt - 1.0f, m[14] + oz}, b3[3] = {a3[0], alt - 300.0f, a3[2]}, h3[3];
+            unsigned saved = g_rayFlags;
+            g_rayFlags = RAY_DONT_CHECK_CHARACTER;
+            g_heliRayH[i][k] = -1.0f; g_heliRayXZ[i][k][0] = ox; g_heliRayXZ[i][k][1] = oz;
+            if (ray_cast(a3, b3, h3, NULL)) { hits++; g_heliRayH[i][k] = alt - h3[1]; if (h3[1] > best) best = h3[1]; if (h3[1] < low) low = h3[1]; }
+            g_rayFlags = saved;
+        }
+        // (from the skids: a Venom sitting on the deck reads 2.6 m from its centre, measured 2026-10-14)
+        g_heliGroundH[i] = best > -1e8f ? alt - best - HELI_SKID_H : 300.0f;
+        for (int k = 0; k < 5; k++) if (g_heliRayH[i][k] >= 0) g_heliRayH[i][k] -= HELI_SKID_H;
+        g_heliGroundFlat[i] = hits == 5 && best - low <= 1.5f;
+        if (g_heliLzOk[i] && g_heliLand[i]) {
+            float lx = m[12] - g_heliLz[i][0], lz = m[14] - g_heliLz[i][2];
+            if (lx * lx + lz * lz < 15.0f * 15.0f) { g_heliGroundH[i] = alt - HELI_SKID_H - g_heliLz[i][1]; g_heliGroundFlat[i] = 1; }
+        }   // the user: the rays land at about the same height = flat (1.5 m across
+                                                                // the 20 m ring: a ~4 degree slope is fine for skids - 0.5 m held a Ka-60 over a gentle pad, 2026-10-15)
+    }
+    float atkT[3] = {0, 0, 0}, atkA[3] = {0, 0, 0};   // the target, and the aim (lead) point
+    if (!g_heliAtk[i] && g_heliAir[i]) { g_heliAir[i] = 0; g_flySeek[i] = 0; g_seekFire[i] = 0; g_flyChase[i] = NULL; press_button(i, 16, 3); }
+    int airTgt = 0;
+    if (g_heliAtk[i]) {
+        char *tp = g_heliAtkTgt[i], *tv = tp && player_exists(tp) ? player_vehicle(tp) : NULL, *ts = tp && player_exists(tp) ? *(char **)(tp + OFF_PLAYER_SOLDIER) : NULL;
+        float *pp = tv ? vehicle_pos(tv, NULL) : ts ? (float *)(ts + OFF_SOLDIER_POSITION) : NULL;
+        if (!pp) {   // dead / gone (the user, 2026-10-15: it stopped at speed and low, and slid into a hillside): up to 60 m over the
+                     // ground and wait there - back on it as soon as it is alive again
+            static unsigned waitLogAt[MAX_BOTS];
+            if (!player_exists(tp)) { g_heliAtk[i] = 0; g_heliGo[i] = 0; bot_log("heliattack: %s - the target left, hovers", pl + OFF_PLAYER_ONLINE_NAME); }
+            else if (g_heliAuto[i]) {   // auto: the next target instead
+                g_heliAtk[i] = 0; g_heliGo[i] = 1; g_heliGoal[i][0] = m[12]; g_heliGoal[i][1] = m[14];
+                g_heliAlt[i] = fmaxf(alt, alt - g_heliGroundH[i] + 60.0f);
+                bot_log("heliauto: %s - %s is down, scans for the next", pl + OFF_PLAYER_ONLINE_NAME, tp + OFF_PLAYER_ONLINE_NAME);
+            } else {
+                if (g_heliAtk[i] != 5) { g_heliAtk[i] = 5; g_heliGoal[i][0] = m[12]; g_heliGoal[i][1] = m[14]; }
+                g_heliGo[i] = 1; g_heliLand[i] = 0;
+                g_heliAlt[i] = fmaxf(g_heliAlt[i], alt - g_heliGroundH[i] + 60.0f);
+                if (H->frame >= waitLogAt[i]) { waitLogAt[i] = H->frame + 10 * 30; bot_log("heliattack: %s - %s is down, waits 60 m up", pl + OFF_PLAYER_ONLINE_NAME, tp + OFF_PLAYER_ONLINE_NAME); }
+            }
+        }
+        else {
+            if (g_heliAtk[i] == 5) { g_heliAtk[i] = 1; g_heliPlanned[i] = 0; memset(g_heliAtkLast[i], 0, sizeof g_heliAtkLast[i]); bot_log("heliattack: %s - %s is back, goes after them", pl + OFF_PLAYER_ONLINE_NAME, tp + OFF_PLAYER_ONLINE_NAME); }
+            memcpy(atkT, pp, 12);
+            if (g_heliAtkLast[i][0] || g_heliAtkLast[i][2])
+                for (int k = 0; k < 3; k++) g_heliAtkVel[i][k] = 0.9f * g_heliAtkVel[i][k] + 0.1f * fmaxf(-40.0f, fminf(40.0f, (atkT[k] - g_heliAtkLast[i][k]) * 30.0f));
+            memcpy(g_heliAtkLast[i], atkT, 12);
+            float dx = atkT[0] - m[12], dz = atkT[2] - m[14], hd = sqrtf(dx * dx + dz * dz);
+            float spd0 = sqrtf(g_heliVel[i][0] * g_heliVel[i][0] + g_heliVel[i][1] * g_heliVel[i][1]);
+            float t = sqrtf(hd * hd + (alt - atkT[1]) * (alt - atkT[1])) / (heli_gun_speed(i) + spd0);
+            atkA[0] = atkT[0] + g_heliAtkVel[i][0] * t; atkA[2] = atkT[2] + g_heliAtkVel[i][2] * t;
+            // the ground just under it - the splash does the work (the user, 2026-10-15: aimed at him, the salvo went over and
+            // landed behind him at that shallow angle)
+            float gy = atkT[1];
+            atkA[1] = heli_ray_ground(atkA[0], atkA[2], atkT[1] + 1.0f, atkT[1] - 8.0f, &gy) ? gy : atkT[1];
+            static unsigned groundSince[MAX_BOTS];   // (on the ground for 2 s before the missiles are given up: flying low read as landed)
+            int up = tv && vehicle_kind(tv) == VK_HELI && !heli_ray_ground(atkT[0], atkT[2], atkT[1] - 3.0f, atkT[1] - 12.0f, &gy);   // (from under its
+                                                                                                                   //  own hull: from 0.5 m down it hit itself)
+            if (up) groundSince[i] = 0; else if (!groundSince[i]) groundSince[i] = H->frame ? H->frame : 1;
+            if (tv && vehicle_kind(tv) == VK_HELI && (up || (g_heliAir[i] == 1 && H->frame - groundSince[i] < 60))) {   // in the air
+                airTgt = 1;
+                atkA[1] = atkT[1] + g_heliAtkVel[i][1] * t;   // (the aircraft itself, not the ground under it)
+                float d3a = sqrtf(dist2(atkT, &m[12]) + (atkT[1] - alt) * (atkT[1] - alt));
+                if (g_heliAir[i] == 1 && d3a < 120.0f && !g_heliMslShot[i]) {   // too close to lock: the gun now, missiles again in 8 s
+                    g_heliAir[i] = 0; g_heliMslReadyAt[i] = H->frame + 8 * 30; g_heliAtk[i] = 1; g_heliPlanned[i] = 0; press_button(i, 16, 3);
+                    bot_log("heliair: %s - %s too close for a lock (%.0f m): the minigun", pl + OFF_PLAYER_ONLINE_NAME, tp + OFF_PLAYER_ONLINE_NAME, d3a);
+                }
+                if (!g_heliAir[i] && H->frame >= g_heliMslReadyAt[i] && d3a >= 150.0f) {
+                    g_heliAir[i] = 1; g_heliMslShot[i] = 0; g_heliLockSince[i] = 0;
+                    press_button(i, 17, 3);
+                    bot_log("heliair: %s - air target %s: switching to missiles, pointing the nose to get a lock", pl + OFF_PLAYER_ONLINE_NAME, tp + OFF_PLAYER_ONLINE_NAME);
+                }
+            } else if (g_heliAir[i] == 1) { g_heliAir[i] = 0; press_button(i, 16, 3); bot_log("heliair: %s - %s is on the ground: back to the gun", pl + OFF_PLAYER_ONLINE_NAME, tp + OFF_PLAYER_ONLINE_NAME); }
+            g_heliGo[i] = 1; g_heliLand[i] = 0;
+            // the gun's own profile (the user, 2026-10-15: a minigun burst from 500 m / 180 m up barely showed): rockets long and
+            // high, a minigun close in and lower
+            int mgun = g_heliAtkNW[i] && g_heliAtkHeat[i][g_heliAtkPod[i] >= 0 ? g_heliAtkPod[i] : 0];
+            float aH = mgun ? g_heliMgH : g_heliAtkH, aR = mgun ? g_heliMgR : g_heliAtkR, aBrk = mgun ? g_heliMgBrk : 200.0f;
+            g_heliAtkFireMax[i] = mgun ? g_heliMgFire : 550.0f; g_heliAtkBrk[i] = aBrk;
+            if (airTgt) aH = 0.0f;   // an aircraft: runs at its own height
+            if (g_heliAir[i] == 1) {   // missiles: 250-550 m off it, at its height - the nose (below) does the work
+                float d3 = sqrtf(hd * hd + (atkT[1] - alt) * (atkT[1] - alt));
+                if (d3 > 550.0f) { g_heliGoal[i][0] = atkT[0]; g_heliGoal[i][1] = atkT[2]; }
+                else if (d3 < 250.0f && hd > 1.0f) { g_heliGoal[i][0] = m[12] - dx / hd * 150.0f; g_heliGoal[i][1] = m[14] - dz / hd * 150.0f; }
+                else { g_heliGoal[i][0] = m[12]; g_heliGoal[i][1] = m[14]; }
+                g_heliAlt[i] = atkT[1];
+            } else if (g_heliAtk[i] == 1) {   // set-up: by the pass plan (fly to the run-in start, turn in on the line)
+                int pr = heli_pod_rounds(i), full = g_heliAtkPod[i] < 0 || pr == 2;   // (rockets reloaded / the minigun cooled)
+                if (g_heliAtkPod[i] >= 0 && g_heliAtkHeat[i][g_heliAtkPod[i]] && vweapon_heat(g_heliAtkW[i][g_heliAtkPod[i]]) < 0.3f) full = 1;   // (cool enough)
+                g_heliAlt[i] = atkT[1] + aH;
+                if (!g_heliPlanned[i] || dist2(g_heliPlanT[i], atkT) > 60.0f * 60.0f) {
+                    if (!heli_plan(i, atkT, aH, aR, &m[12], aBrk)) {   // nothing clear: straight in from where it is
+                        float rl = hd > 1.0f ? hd : 1.0f;
+                        g_heliPlanD[i][0] = dx / rl; g_heliPlanD[i][1] = dz / rl; g_heliPlanIn[i] = aR; g_heliPlanOut[i] = aR * 0.7f; g_heliPlanSide[i] = 1;
+                        memcpy(g_heliPlanT[i], atkT, 12); g_heliPlanned[i] = 1; g_heliPlanKind[i] = 1;
+                        bot_log("heliattack: %s finds no clear line round %s - straight in", pl + OFF_PLAYER_ONLINE_NAME, tp + OFF_PLAYER_ONLINE_NAME);
+                    }
+                }
+                float d0 = g_heliPlanD[i][0], d1 = g_heliPlanD[i][1], Lin = g_heliPlanIn[i];
+                float rx = m[12] - atkT[0], rz = m[14] - atkT[2], along = -(rx * d0 + rz * d1), across = fabsf(rx * d1 - rz * d0);
+                int onLine = across < 35.0f && along > Lin * 0.75f && along < Lin + 60.0f;
+                g_heliGoal[i][0] = atkT[0] - d0 * Lin; g_heliGoal[i][1] = atkT[2] - d1 * Lin;   // the run-in start
+                if (onLine && full && alt > atkT[1] + aH - 25.0f) {
+                    g_heliAtk[i] = 2;
+                    bot_log("heliattack: %s turns in - %.0f m out (target at %.0f %.0f %.0f, %s)", pl + OFF_PLAYER_ONLINE_NAME, hd, atkT[0], atkT[1], atkT[2], tv ? "in a vehicle" : "on foot");
+                }
+            } else if (g_heliAtk[i] == 2) {   // the run: down a shallow line at the lead point
+                g_heliGoal[i][0] = atkA[0]; g_heliGoal[i][1] = atkA[2];
+                g_heliAlt[i] = atkT[1] + aH;   // level at the set-up height: the collective holds it as the nose goes over (the user)
+                static unsigned char wasFiring[MAX_BOTS];
+                int pr = heli_pod_rounds(i), dry = pr == 0 && wasFiring[i] && !mgun;   // (a minigun: overheating does not end the pass - it
+                                                                                      //  holds fire, cools and opens up again; the user: "good enough")
+                wasFiring[i] = pr == 1 ? 1 : wasFiring[i];
+                // the pass ends once it is over / past the target (the user: keep firing until it has passed overhead or the target
+                // is dead), the guns dry (rockets), or after 15 s on the run at the latest
+                static unsigned runSince[MAX_BOTS];
+                if (!runSince[i]) runSince[i] = H->frame ? H->frame : 1;
+                int passed = H->frame - runSince[i] > 60 && g_heliPlanD[i][0] * dx + g_heliPlanD[i][1] * dz < 0.0f;   // (past it along the line)
+                if (hd < aBrk || dry || passed || H->frame - runSince[i] > 15 * 30) {
+                    runSince[i] = 0;
+                    wasFiring[i] = 0;
+                    // on through at speed, the way it was running (the user, 2026-10-15: slowing down after a pass made it an easy
+                    // target) - then a fast turn back for the next pass from the other side
+                    g_heliAtkB[i][0] = g_heliPlanD[i][0]; g_heliAtkB[i][1] = g_heliPlanD[i][1];   // (along the planned line: its far end was checked clear)
+                    g_heliAtk[i] = 3;
+                    bot_log("heliattack: %s breaks off at %.0f m (%s)", pl + OFF_PLAYER_ONLINE_NAME, hd, dry ? "guns dry - pods empty" : passed ? "over / past it" : hd < aBrk ? "on top of it" : "15 s on the run");
+                }
+            } else if (g_heliAtk[i] == 3) {   // through: straight on at full speed, same height over its ground
+                g_heliGoal[i][0] = m[12] + g_heliAtkB[i][0] * 2000.0f; g_heliGoal[i][1] = m[14] + g_heliAtkB[i][1] * 2000.0f; g_heliAlt[i] = atkT[1] + aH;
+                int behind = dx * g_heliAtkB[i][0] + dz * g_heliAtkB[i][1] < 0;   // the target is behind it now
+                if (behind && hd > fmaxf(60.0f, g_heliPlanOut[i] - 100.0f)) {
+                    g_heliAtk[i] = 4; g_heliAtkB[i][0] = m[12]; g_heliAtkB[i][1] = m[14];   // (the pivot point)
+                    bot_log("heliattack: %s pivots at %.0f m", pl + OFF_PLAYER_ONLINE_NAME, hd);
+                }
+            } else {   // 4, the pivot: stop where it is and swing the nose round on the spot to face it (the user: "turn on a dime")
+                g_heliGoal[i][0] = g_heliAtkB[i][0]; g_heliGoal[i][1] = g_heliAtkB[i][1]; g_heliAlt[i] = atkT[1] + aH;
+                g_heliWantHdg[i] = atan2f(dx, dz) * 57.29578f;
+                float eh = g_heliWantHdg[i] - hdg;
+                while (eh > 180.0f) eh -= 360.0f;
+                while (eh < -180.0f) eh += 360.0f;
+                float sp4 = sqrtf(g_heliVel[i][0] * g_heliVel[i][0] + g_heliVel[i][1] * g_heliVel[i][1]);
+                if (fabsf(eh) < 15.0f && sp4 < 10.0f) {
+                    g_heliAtk[i] = 1;
+                    if (g_heliPlanKind[i] == 0 && hd > 1.0f) {   // on its best line: straight back down it the other way
+                        g_heliPlanD[i][0] = dx / hd; g_heliPlanD[i][1] = dz / hd; g_heliPlanIn[i] = hd; memcpy(g_heliPlanT[i], atkT, 12);
+                        bot_log("heliattack: %s is round - back down the same line from %.0f m", pl + OFF_PLAYER_ONLINE_NAME, hd);
+                    } else {   // came in straight: now the one sidestep onto the best line
+                        g_heliPlanned[i] = 0; g_heliNoOnIt[i] = 1;
+                        bot_log("heliattack: %s is round - plans its line from %.0f m", pl + OFF_PLAYER_ONLINE_NAME, hd);
+                    }
+                }
+            }
+        }
+    }
+    if (g_heliAtk[i] && g_heliGroundH[i] < 250.0f)   // never under 25 m over what is below it (the user's mountain: at 40 m over HIS
+        g_heliAlt[i] = fmaxf(g_heliAlt[i], alt - g_heliGroundH[i] + 25.0f);   // ground it flew into the hill between them, 2026-10-15)
+    float dist = 0, vWantX = 0, vWantZ = 0;
+    if (g_heliGo[i]) {
+        // a velocity towards the point: as fast as it can still stop from (~3 m/s^2), capped; none within 2 m
+        float dx = g_heliGoal[i][0] - m[12], dz = g_heliGoal[i][1] - m[14];
+        dist = sqrtf(dx * dx + dz * dz);
+        float vAlong = dist > 1e-3f ? (g_heliVel[i][0] * dx + g_heliVel[i][1] * dz) / dist : 0.0f;   // speed towards the point
+        float dEff = fmaxf(0.0f, dist - fmaxf(0.0f, vAlong) * 1.0f);   // where it will be in ~1 s (the tilt lags): brake for that
+        float sp = dist < 1.0f ? 0.0f : fminf(g_heliMaxSpeed, fminf(sqrtf(2.0f * 1.5f * dEff) * 0.85f, fmaxf(dEff, dist * 0.2f) * 0.35f));   // (brakes early and gently: the tilt lags ~1 s - 7 m/s at 8 m, then 10 m/s at 5 m, overshot it)
+        if (dist > 1e-3f) { vWantX = dx / dist * sp; vWantZ = dz / dist * sp; }
+        if (g_heliAtk[i] == 3 && dist > 1e-3f) { vWantX = dx / dist * 40.0f; vWantZ = dz / dist * 40.0f; }   // through: flat out
+        if (g_heliAtk[i] == 4 && 0) {   // (the wide turn at speed - replaced by the pivot)
+            float vx = g_heliVel[i][0], vz = g_heliVel[i][1], va = atan2f(vx, vz), ta = atan2f(dx, dz), d = ta - va;
+            while (d > 3.14159265f) d -= 6.2831853f;
+            while (d < -3.14159265f) d += 6.2831853f;
+            float na = fabsf(d) > 1.2f ? va + 0.524f * g_heliPlanSide[i] : va + fmaxf(-0.524f, fminf(0.524f, d));   // (a second's worth: 30 deg
+                                                                                     // on - towards the side the plan found clear while it is well behind)
+            vWantX = sinf(na) * 40.0f; vWantZ = cosf(na) * 40.0f;
+        }
+        // Look ahead along the way (the user, 2026-10-15: a Littlebird taking off in a valley flew straight into the wall behind
+        // it): a ray from past the rotor to 60 m / 6 s ahead, sloping 5 m down - anything there (terrain, a cliff, a building):
+        // no headway, climb flat out until it is clear. (Off on a landing's final approach: the ground there is the point.)
+        static unsigned blockedUntil[MAX_BOTS];
+        if (dist > 30.0f && g_heliLand[i] < 2) {
+            float ux = dx / dist, uz = dz / dist, spd1 = sqrtf(g_heliVel[i][0] * g_heliVel[i][0] + g_heliVel[i][1] * g_heliVel[i][1]);
+            float L = fmaxf(60.0f, spd1 * 6.0f), a3[3] = {m[12] + ux * 8.0f, alt - 1.0f, m[14] + uz * 8.0f}, b3[3] = {m[12] + ux * L, alt - 6.0f, m[14] + uz * L}, h3[3];
+            unsigned saved = g_rayFlags;
+            g_rayFlags = RAY_DONT_CHECK_CHARACTER;
+            int hit = ray_cast(a3, b3, h3, NULL);
+            g_rayFlags = saved;
+            // blocked: another way first (the user, 2026-10-15: after a pass it hung on a mountain face, climbing) - 30..150
+            // degrees either side, nearest first, held 1.5 s; only boxed in all round: stop and climb. Mid-pass ("through"): turn
+            // back for the next pass now.
+            static unsigned detourUntil[MAX_BOTS];
+            static float detourA[MAX_BOTS];
+            if (hit && g_heliAtk[i] == 3) { g_heliAtk[i] = 4; hit = 0; bot_log("heliattack: %s - terrain ahead, turns back now", pl + OFF_PLAYER_ONLINE_NAME); }
+            if (hit && H->frame >= detourUntil[i]) {
+                float base = atan2f(ux, uz);
+                static const float tries[10] = {30, -30, 60, -60, 90, -90, 120, -120, 150, -150};
+                for (int k = 0; k < 10; k++) {
+                    float a = base + tries[k] * 0.0174533f, b4[3] = {m[12] + sinf(a) * L, alt - 6.0f, m[14] + cosf(a) * L}, a4[3] = {m[12] + sinf(a) * 8.0f, alt - 1.0f, m[14] + cosf(a) * 8.0f}, h4[3];
+                    g_rayFlags = RAY_DONT_CHECK_CHARACTER;
+                    int hk = ray_cast(a4, b4, h4, NULL);
+                    g_rayFlags = saved;
+                    if (!hk) { detourA[i] = a; detourUntil[i] = H->frame + 45; bot_log("heli: %s - something ahead, turns %+.0f deg round it", pl + OFF_PLAYER_ONLINE_NAME, tries[k]); break; }
+                }
+            }
+            if (H->frame < detourUntil[i]) { float vs1 = fmaxf(15.0f, fminf(sp, 30.0f)); vWantX = sinf(detourA[i]) * vs1; vWantZ = cosf(detourA[i]) * vs1; hit = 0; }
+            if (hit) {
+                if (H->frame >= blockedUntil[i]) bot_log("heli: %s - boxed in %.0f m ahead - stops and climbs", pl + OFF_PLAYER_ONLINE_NAME,
+                                                       sqrtf((h3[0] - m[12]) * (h3[0] - m[12]) + (h3[2] - m[14]) * (h3[2] - m[14])));
+                blockedUntil[i] = H->frame + 20;
+            }
+        }
+        g_heliBlocked[i] = H->frame < blockedUntil[i];
+        if (g_heliBlocked[i]) { vWantX = 0; vWantZ = 0; }
+        if (dist > 25.0f) g_heliWantHdg[i] = atan2f(dx, dz) * 57.29578f;   // nose along the way (close in: keep the heading)
+        if (g_heliLand[i] && g_heliLzOk[i] && dist < 80.0f) {   // landing on a road / clearing: the nose along its long axis (the user)
+            float a = g_heliLz[i][3], cur = atan2f(m[8], m[10]) * 57.29578f, d1 = a - cur;
+            while (d1 > 180.0f) d1 -= 360.0f;
+            while (d1 < -180.0f) d1 += 360.0f;
+            if (fabsf(d1) > 90.0f) a += 180.0f;   // whichever end of the axis is nearer the way it faces
+            while (a > 180.0f) a -= 360.0f;
+            g_heliWantHdg[i] = a;
+        }
+        // the velocity error in the helicopter's frame -> attitude: forward = nose down (pitch < 0), right = bank right (bank < 0)
+        float hl = sqrtf(m[8] * m[8] + m[10] * m[10]) + 1e-6f, fx = m[8] / hl, fz = m[10] / hl, rx = fz, rz = -fx;
+        float ex = vWantX - g_heliVel[i][0], ez = vWantZ - g_heliVel[i][1];
+        float eFwd = ex * fx + ez * fz, eRight = ex * rx + ez * rz;
+        float tcap = dist < 30.0f ? 12.0f : 25.0f;   // (gentle close in)
+        g_heliWantPitch[i] = fmaxf(-tcap, fminf(tcap, -eFwd * 1.1f));
+        g_heliWantBank[i] = fmaxf(-tcap, fminf(tcap, -eRight * 1.1f));
+    }
+    if (g_heliAir[i] == 1 && g_heliAtk[i]) {
+        char *tp = g_heliAtkTgt[i];
+        float rx = atkT[0] - m[12], ry = atkT[1] - alt, rz = atkT[2] - m[14], rh = sqrtf(rx * rx + rz * rz) + 1e-3f, r3 = sqrtf(rh * rh + ry * ry);
+        float wantH = atan2f(rx, rz) * 57.29578f, eh = wantH - hdg;
+        while (eh > 180.0f) eh -= 360.0f;
+        while (eh < -180.0f) eh += 360.0f;
+        g_heliWantHdg[i] = wantH;
+        g_heliWantPitch[i] = fmaxf(-30.0f, fminf(20.0f, atan2f(ry, rh) * 57.29578f));
+        float hl = sqrtf(m[8] * m[8] + m[10] * m[10]) + 1e-6f, sx = m[10] / hl, sz = -m[8] / hl;
+        g_heliWantBank[i] = fmaxf(-20.0f, fminf(20.0f, (g_heliVel[i][0] * sx + g_heliVel[i][1] * sz) * 1.0f - eh * 1.5f));
+        float off = acosf(fmaxf(-1.0f, fminf(1.0f, (m[8] * rx + m[9] * ry + m[10] * rz) / (r3 + 1e-3f)))) * 57.29578f;
+        if (r3 < g_seekRange && r3 > 110.0f && off < g_seekCone) { if (!g_heliLockSince[i]) g_heliLockSince[i] = H->frame ? H->frame : 1; }
+        else if (g_heliLockSince[i] && !g_heliMslShot[i]) { g_heliLockSince[i] = 0; bot_log("heliair: %s loses the lock (%.0f m, %.1f deg off)", pl + OFF_PLAYER_ONLINE_NAME, r3, off); }
+        float held = g_heliLockSince[i] ? (H->frame - g_heliLockSince[i]) / 30.0f : 0.0f;
+        if (held >= HELI_LOCK_TIME && g_heliMslShot[i] < 2 && H->frame - g_heliMslAt[i] >= 30) {
+            if (!g_heliMslShot[i]) bot_log("heliair: %s LOCKED on %s (%.0f m, %.1f deg off)", pl + OFF_PLAYER_ONLINE_NAME, tp + OFF_PLAYER_ONLINE_NAME, r3, off);
+            press_button(i, g_seekFireEia, 3);
+            g_flySeek[i] = 1; g_seekFire[i] = 1; g_flyChase[i] = tp; g_seekFiredAt[i] = H->frame;   // (the missile tick gives it the target)
+            g_heliMslAt[i] = H->frame; g_heliMslShot[i]++;
+            bot_log("heliair: %s fires missile %d at %s", pl + OFF_PLAYER_ONLINE_NAME, g_heliMslShot[i], tp + OFF_PLAYER_ONLINE_NAME);
+        }
+        if (g_heliMslShot[i] >= 2 && H->frame - g_heliMslAt[i] > 30) {   // both away: the gun to finish it
+            g_heliAir[i] = 2; g_heliMslReadyAt[i] = H->frame + 20 * 30; g_heliAtk[i] = 1;
+            g_flySeek[i] = 0; g_seekFire[i] = 0; g_flyChase[i] = NULL;
+            press_button(i, 16, 3);
+            bot_log("heliair: %s - both missiles away, switching to the minigun to finish", pl + OFF_PLAYER_ONLINE_NAME);
+        }
+        static unsigned lockLogAt[MAX_BOTS];
+        if (H->frame >= lockLogAt[i] && !g_heliMslShot[i]) { lockLogAt[i] = H->frame + 30; bot_log("heliair: %s on %s: %.0f m, nose %.1f deg off, lock %.1f/%.1f s", pl + OFF_PLAYER_ONLINE_NAME, tp + OFF_PLAYER_ONLINE_NAME, r3, off, held, HELI_LOCK_TIME); }
+    }
+    if ((g_heliAtk[i] == 1 || g_heliAtk[i] == 3 || g_heliAtk[i] == 4) && g_heliAir[i] != 1 && g_heliAtkPod[i] >= 0) {
+        // snap shots (the user, 2026-10-15): setting up, through, turning back - the nose not steered for it, but whenever it
+        // crosses the aim (2.5 deg) in range, the gun not near overheating: fire
+        char *w = g_heliAtkW[i][g_heliAtkPod[i]];
+        float ox = m[12], oy = alt, oz = m[14];
+        if (gun_ok(w)) { float *wp = (float *)(w + 0x60); ox = wp[0]; oy = wp[1]; oz = wp[2]; }
+        float R[3] = {atkA[0] - ox, atkA[1] - oy, atkA[2] - oz}, V[3] = {g_heliVel[i][0], g_heliVs[i], g_heliVel[i][1]}, D[3];
+        float gsp = heli_gun_speed(i), tf = sqrtf(R[0] * R[0] + R[1] * R[1] + R[2] * R[2]) / gsp;
+        for (int it = 0; it < 2; it++) { for (int k = 0; k < 3; k++) D[k] = R[k] - V[k] * tf; tf = sqrtf(D[0] * D[0] + D[1] * D[1] + D[2] * D[2]) / gsp; }
+        float dh = sqrtf(D[0] * D[0] + D[2] * D[2]) + 1e-3f, eh = atan2f(D[0], D[2]) * 57.29578f + g_heliAtkYaw - hdg, ep = atan2f(D[1], dh) * 57.29578f + (g_heliAtkHeat[i][g_heliAtkPod[i]] ? g_heliMgPitch : 0.0f) - pitch;
+        while (eh > 180.0f) eh -= 360.0f;
+        while (eh < -180.0f) eh += 360.0f;
+        int heatGun = g_heliAtkHeat[i][g_heliAtkPod[i]];
+        float heat = heatGun ? vweapon_heat(w) : 0.0f;
+        int ok = heli_pod_rounds(i) != 0 && (!heatGun || heat < 0.85f);
+        if (ok && dh < g_heliAtkFireMax[i] && dh > 30.0f && fabsf(eh) < 2.5f && fabsf(ep) < 2.5f) {
+            press_button(i, EIA_FIRE, 2); g_rktBot = i; g_rktAt = H->frame;
+            static unsigned snapLogAt[MAX_BOTS];
+            if (H->frame >= snapLogAt[i]) { snapLogAt[i] = H->frame + 30; bot_log("heliattack: %s snap shot at %.0f m (err hdg %.1f pitch %.1f)", pl + OFF_PLAYER_ONLINE_NAME, dh, eh, ep); }
+        }
+    }
+    if (g_heliAtk[i] == 2 && g_heliAir[i] != 1) {
+        float dx = atkA[0] - m[12], dz = atkA[2] - m[14], hd = sqrtf(dx * dx + dz * dz) + 1e-3f;
+        // the rockets leave at 300 m/s along the nose PLUS the helicopter's own velocity (the user, 2026-10-15: diving forward
+        // they went way over and to the side): point the pods where (aim - own velocity x flight time) is - solved twice
+        // from the gun itself, not the helicopter's centre (the user: a Littlebird's stream went consistently to one side - its gun
+        // hangs off the side of the fuselage)
+        float ox = m[12], oy = alt, oz = m[14];
+        if (g_heliAtkPod[i] >= 0 && gun_ok(g_heliAtkW[i][g_heliAtkPod[i]])) { float *wp = (float *)(g_heliAtkW[i][g_heliAtkPod[i]] + 0x60); ox = wp[0]; oy = wp[1]; oz = wp[2]; }
+        float R[3] = {atkA[0] - ox, atkA[1] - oy, atkA[2] - oz}, V[3] = {g_heliVel[i][0], g_heliVs[i], g_heliVel[i][1]}, D[3];
+        float gsp = heli_gun_speed(i), tf = sqrtf(R[0] * R[0] + R[1] * R[1] + R[2] * R[2]) / gsp;
+        for (int it = 0; it < 2; it++) {
+            for (int k = 0; k < 3; k++) D[k] = R[k] - V[k] * tf;
+            tf = sqrtf(D[0] * D[0] + D[1] * D[1] + D[2] * D[2]) / gsp;
+        }
+        float dh = sqrtf(D[0] * D[0] + D[2] * D[2]) + 1e-3f;
+        float wantH = atan2f(D[0], D[2]) * 57.29578f + g_heliAtkYaw, wantP = atan2f(D[1], dh) * 57.29578f;   // (nose down = negative pitch)
+        if (g_heliAtkPod[i] >= 0 && g_heliAtkHeat[i][g_heliAtkPod[i]]) wantP += g_heliMgPitch;
+        g_heliWantHdg[i] = wantH;
+        // whatever it takes to keep the pods on it (the user, 2026-10-15): pitch free, the pedals stiffer (below), and roll
+        // into the turn - a bank swings the nose round faster than the pedals against the tail fin - besides killing drift
+        g_heliWantPitch[i] = fmaxf(-80.0f, fminf(20.0f, wantP));
+        float hl = sqrtf(m[8] * m[8] + m[10] * m[10]) + 1e-6f, rx = m[10] / hl, rz = -m[8] / hl;
+        float eh = wantH - hdg;
+        while (eh > 180.0f) eh -= 360.0f;
+        while (eh < -180.0f) eh += 360.0f;
+        g_heliWantBank[i] = fmaxf(-25.0f, fminf(25.0f, (g_heliVel[i][0] * rx + g_heliVel[i][1] * rz) * 1.0f - eh * 2.0f));   // (bank < 0 = right)
+        float ep = wantP - pitch;
+        float tol = fmaxf(1.5f, atan2f(8.0f, hd) * 57.29578f);   // within ~8 m of the aim point at that range (the salvo spreads)
+        // opens fire from 550 m once on it, then holds the trigger down to the break (the user: empty the pods, not short taps)
+        // unless the nose wanders well off (3x the window)
+        static unsigned char firing[MAX_BOTS];
+        int heatGun = g_heliAtkPod[i] >= 0 && g_heliAtkHeat[i][g_heliAtkPod[i]];
+        float heat = heatGun ? vweapon_heat(g_heliAtkW[i][g_heliAtkPod[i]]) : 0.0f;
+        if (hd >= g_heliAtkFireMax[i] || hd <= g_heliAtkBrk[i] || heli_pod_rounds(i) == 0) firing[i] = 0;
+        else if (!firing[i] && fabsf(eh) < tol && fabsf(ep) < 0.5f && (!heatGun || heat < 0.3f)) firing[i] = 1;   // (a hot minigun: cooled first)   // (pitch settled first: 1 degree is ~27 m long or short)
+        else if (firing[i] && (fabsf(eh) > 3.0f * tol || fabsf(ep) > 3.0f * tol)) firing[i] = 0;
+        if (firing[i]) { press_button(i, EIA_FIRE, 2); g_rktBot = i; g_rktAt = H->frame; }
+        if (firing[i] && H->frame >= g_heliAtkFireAt[i]) {
+            g_heliAtkFireAt[i] = H->frame + 20;
+            if (H->frame >= g_heliAtkLogAt[i]) { g_heliAtkLogAt[i] = H->frame + 30; bot_log("heliattack: %s fires at %.0f m, guns %d (0 dry 1 some 2 ready) (nose %.1f wanted %.1f deg, err hdg %.1f pitch %.1f, speed %.0f vs %.1f, lead %.0f m)", pl + OFF_PLAYER_ONLINE_NAME, hd, heli_pod_rounds(i), pitch, wantP, eh, ep,
+                sqrtf(V[0] * V[0] + V[2] * V[2]), V[1],
+                sqrtf((atkA[0] - atkT[0]) * (atkA[0] - atkT[0]) + (atkA[2] - atkT[2]) * (atkA[2] - atkT[2]))); }
+        }
+    }
+    // collective: a vertical speed towards the wanted height (at most 4 m/s), a learned trim, more lift the more it is tilted
+    float vsWant = fmaxf(-4.0f, fminf(4.0f, (g_heliAlt[i] - alt) * 0.4f));
+    float tilt = 1.0f - fmaxf(-1.0f, fminf(1.0f, m[5]));   // 1 - up.y: 0 level, ~0.026 at 13 degrees
+    if (g_heliBlocked[i] && g_heliGo[i]) vsWant = 4.0f;   // something ahead: up, flat out
+    if ((!g_heliLand[i] || g_heliLand[i] == 1) && g_heliAtk[i] != 2 && !g_heliBlocked[i]) g_heliTrim[i] = fmaxf(-0.5f, fminf(1.0f, g_heliTrim[i] + 0.003f * (vsWant - g_heliVs[i])));
+    // One approach, not three stages (the user, 2026-10-15: fly there, stop, then descend was one at a time): cruise height
+    // until it meets a ~27 degree glide slope to the spot (height over the ground = half the distance left, from 150 m out
+    // at most), then down the slope while the velocity layer keeps translating it onto the spot - slowing and sinking
+    // together, arriving over it low.
+    if (g_heliLand[i] == 1 && (dist < 2.0f || (dist < 150.0f && g_heliGroundH[i] >= dist * 0.5f))) {
+        g_heliLand[i] = 2; g_heliLandAt[i] = H->frame;
+        bot_log("heliland: %s on the glide slope - %.0f m out, %.1f m up", pl + OFF_PLAYER_ONLINE_NAME, dist, g_heliGroundH[i]);
+    }
+    if (g_heliLand[i] == 2) {   // the approach: down the slope (4 m/s at most), the last metres at 0.5 m/s; no trim learning
+        float tgt = dist * 0.5f;
+        if (!g_heliGroundFlat[i] && dist >= 5.0f) tgt = fmaxf(tgt, 3.0f);   // uneven under it on the way in: not low yet
+        float excess = g_heliGroundH[i] - tgt;
+        vsWant = excess > 0 ? -fminf(4.0f, fmaxf(dist < 3.0f ? 0.5f : 0.0f, excess * 0.4f)) : fminf(2.0f, -excess * 0.4f);
+        if (g_heliGroundH[i] < 6.0f && vsWant < 0) vsWant = fmaxf(vsWant, -fmaxf(0.5f, (g_heliGroundH[i] - 1.0f) * 0.3f));   // gentle near the ground
+        if (!g_heliGroundFlat[i] && g_heliGroundH[i] < 15.0f && dist < 5.0f) {   // over the spot and not flat: hold, do not put it down
+            vsWant = 0;
+            // slide away from the drop: from the low rays' side (or no hit) towards the top surface's (within 0.5 m of the
+            // highest), up to 20 m - (the mean of the high offsets minus the mean of the low ones: left + right high alone cancel)
+            float hx = 0, hz = 0, lx = 0, lz = 0; int nh = 0, nlo = 0;
+            for (int k = 0; k < 5; k++)
+                if (g_heliRayH[i][k] >= 0 && g_heliRayH[i][k] <= g_heliGroundH[i] + 0.5f) { hx += g_heliRayXZ[i][k][0]; hz += g_heliRayXZ[i][k][1]; nh++; }
+                else { lx += g_heliRayXZ[i][k][0]; lz += g_heliRayXZ[i][k][1]; nlo++; }
+            float sx = (nh ? hx / nh : 0) - (nlo ? lx / nlo : 0), sz = (nh ? hz / nh : 0) - (nlo ? lz / nlo : 0);
+            float sl = sqrtf(sx * sx + sz * sz);
+            if (sl > 1.0f && g_heliShift[i] < 20.0f) {
+                g_heliGoal[i][0] += sx / sl * 0.05f; g_heliGoal[i][1] += sz / sl * 0.05f; g_heliShift[i] += 0.05f;   // 1.5 m/s
+            }
+            static unsigned flatLogAt[MAX_BOTS];
+            if (H->frame - flatLogAt[i] > 90) { flatLogAt[i] = H->frame; bot_log("heliland: %s - the ground under it is not flat, holding %.1f m up, slid %.1f m (rays fwd %.1f fr %.1f fl %.1f r %.1f l %.1f)", pl + OFF_PLAYER_ONLINE_NAME, g_heliGroundH[i], g_heliShift[i],
+                g_heliRayH[i][0], g_heliRayH[i][1], g_heliRayH[i][2], g_heliRayH[i][3], g_heliRayH[i][4]); }
+        }
+        float hs = sqrtf(g_heliVel[i][0] * g_heliVel[i][0] + g_heliVel[i][1] * g_heliVel[i][1]);
+        if (g_heliGroundH[i] < 3.0f && hs > 0.6f && vsWant < 0) vsWant = 0;   // the last 3 m only once it has stopped drifting
+        if (g_heliGroundH[i] < 1.0f && g_heliGroundFlat[i]) { g_heliLand[i] = 3; g_heliLandAt[i] = H->frame; bot_log("heliland: %s %.1f m up - cuts the collective", pl + OFF_PLAYER_ONLINE_NAME, g_heliGroundH[i]); }
+    }
+    float thr = fmaxf(-1.0f, fminf(1.0f, g_heliTrim[i] + 0.15f * (vsWant - g_heliVs[i]) + 4.0f * tilt));
+    if (g_heliLand[i] == 2 && vsWant <= 0) thr = fminf(thr, g_heliTrim[i] + 0.05f + 4.0f * tilt);   // a sink, not a climb (the tilt's lift
+                                                                                                    // still allowed: it translates on the way down)
+    if (g_heliLand[i] >= 3) {   // cut: full "S" - planted; held to stay down
+        thr = -1.0f;
+        if (g_heliLand[i] == 3 && H->frame - g_heliLandAt[i] > 20 && fabsf(g_heliVs[i]) < 0.2f) {
+            g_heliLand[i] = 4; bot_log("heliland: %s landed (%.1f m above the ground reading)", pl + OFF_PLAYER_ONLINE_NAME, g_heliGroundH[i]); }
+    }
+    // pitch stick (+ = nose down, a rate): towards the wanted pitch, damped by the pitch rate
+    // + on a strafing run, a learned pitch trim: at speed the airflow holds the nose ~1.2 degrees shallow of the aim, and from
+    // 180 m up that put the salvo ~30 m long (rocket impacts, 2026-10-15)
+    static float pitchI[MAX_BOTS];
+    if (!g_heliAtk[i]) pitchI[i] = 0;   // (kept between passes: the next run starts trimmed)
+    else if (g_heliAtk[i] == 2 && fabsf(g_heliWantPitch[i] - pitch) < 10.0f) pitchI[i] = fmaxf(-0.4f, fminf(0.4f, pitchI[i] - (g_heliWantPitch[i] - pitch) * 0.0015f));
+    float pin = fmaxf(-1.0f, fminf(1.0f, -(g_heliWantPitch[i] - pitch) * 0.04f + pRate * 0.015f + (g_heliAtk[i] == 2 ? pitchI[i] : 0.0f)));
+    // roll stick: held only once its sign is known (heliroll); a test tap overrides it
+    float rin = g_heliRollSign ? fmaxf(-1.0f, fminf(1.0f, g_heliRollSign * ((g_heliWantBank[i] - bank) * 0.04f - bRate * 0.015f))) : 0.0f;
+    float yin = 0;
+    if (g_heliGo[i]) {
+        static float lastHdg[MAX_BOTS];
+        float he = g_heliWantHdg[i] - hdg, hRate = hdg - lastHdg[i];
+        while (he > 180.0f) he -= 360.0f;
+        while (he < -180.0f) he += 360.0f;
+        while (hRate > 180.0f) hRate -= 360.0f;
+        while (hRate < -180.0f) hRate += 360.0f;
+        lastHdg[i] = hdg;
+        // + a learned pedal trim: in forward flight the tail fin weathervanes the nose onto the way it is moving, so a few
+        // degrees off it (a strafing run's lead) the plain term sat 4-6 degrees out (Mi-28, 2026-10-15)
+        static float yawI[MAX_BOTS];
+        if (fabsf(he) < 20.0f) yawI[i] = fmaxf(-0.4f, fminf(0.4f, yawI[i] - he * 0.0006f));
+        float kp = g_heliAtk[i] == 2 ? 0.06f : 0.03f;   // (a strafing run: stiffer)
+        yin = fmaxf(-1.0f, fminf(1.0f, -he * kp + hRate * 30.0f * 0.02f + yawI[i]));
+    }
+    int tap = H->frame < g_heliTapUntil[i];
+    if (tap) { rin = g_heliTapRoll[i]; yin = g_heliTapYaw[i]; }
+    if (g_heliLand[i] == 4) { rin = pin = yin = 0; }
+    H->botMove[i][0] = thr; H->botMove[i][1] = 0; H->botMove[i][2] = yin;
+    g_seatYaw[i] = rin; g_seatPitch[i] = pin;
+    if (H->frame >= g_heliLogAt[i]) {
+        g_heliLogAt[i] = H->frame + 10;
+        float spd = sqrtf(g_heliVel[i][0] * g_heliVel[i][0] + g_heliVel[i][1] * g_heliVel[i][1]);
+        bot_log("heli: %s alt %.1f->%.0f vs %.1f | pitch %.1f->%.0f bank %.1f->%.0f hdg %.0f->%.0f | speed %.1f (want %.1f) to go %.0f gnd %.1f%s%s | thr %.2f (trim %.2f) pitch %.2f roll %.2f yaw %.2f%s",
+                pl + OFF_PLAYER_ONLINE_NAME, alt, g_heliAlt[i], g_heliVs[i], pitch, g_heliWantPitch[i], bank, g_heliWantBank[i], hdg, g_heliWantHdg[i],
+                spd, sqrtf(vWantX * vWantX + vWantZ * vWantZ), dist, g_heliGroundH[i], g_heliGroundFlat[i] ? " flat" : " uneven",
+                g_heliLand[i] == 1 ? " LAND:to spot" : g_heliLand[i] == 2 ? " LAND:settling" : g_heliLand[i] == 3 ? " LAND:cut" : g_heliLand[i] == 4 ? " LANDED" : "",
+                thr, g_heliTrim[i], pin, rin, yin, tap ? " TAP" : "");
+    }
+}
 static void fly_tick(int i)
 {
     char *pl = H->bots[i], *veh = player_vehicle(pl);
@@ -10393,6 +11353,7 @@ static void fly_tick(int i)
         g_flying[i] = 0; g_flyAuto[i] = 0; g_driving[i] = 0; return;
     }
     g_driving[i] = 1;
+    if (g_heliHold[i]) { heli_tick(i, veh); return; }
     if (g_flyAuto[i]) {   // ---- autopilot ----
         float *m = vehicle_xf(veh);
         if (!m) return;
@@ -10992,7 +11953,7 @@ static char *pilot_heavy_nearest(int i, const float *from, float *outD2)   // th
     for (int k = 0; k < nv; k++) {
         char *v = vs[k];
         // (no jets: a boat cannot land on a carrier deck - the jets are the respawn rule's)
-        if (!vehicle_ok(v) || !pilot_ride_kind(vehicle_kind(v)) || vehicle_kind(v) == VK_JET || vehicle_is_mobile_aa(v) || !driver_seat_free(v) || vehicle_bad(v) ||
+        if (!vehicle_ok(v) || !pilot_ride_kind(vehicle_kind(v)) || ride_is_air(vehicle_kind(v)) || vehicle_is_mobile_aa(v) || !driver_seat_free(v) || vehicle_bad(v) ||
             !pilot_ride_ours(v, team) || ride_unreachable(i, v)) continue;
         int taken = 0;
         for (int j = 0; j < H->botCount && !taken; j++) if (j != i && ((g_drive[j].phase && g_drive[j].veh == v) || g_pilotRide[j] == v)) taken = 1;
@@ -11003,6 +11964,134 @@ static char *pilot_heavy_nearest(int i, const float *from, float *outD2)   // th
     if (outD2) *outD2 = bd;
     return best;
 }
+// ---- Ride requests (the user, 2026-10-15): "Need pickup" from anyone (human or bot) goes on a board; the nearest Pilot
+// driving a jeep with 2+ free seats and no riders takes it ("Affirmative"), drives to the caller and calls "Get in!"; once
+// they are aboard (and whoever of theirs fits, 10 s), the taxi's delivery takes over (the nearest flag not ours, or the
+// front). No driver for 60 s: given up. The driver dies / leaves its jeep: given up (the caller walks or finds a ride).
+#define RIDE_REQS 8
+#define RIDE_WAIT_FRAMES (60 * 30)
+#define RIDE_BOARD_FRAMES (15 * 30)   // there and nobody got in (the user: 15 s at most, then back to its own job)
+typedef struct { char *caller; float pos[3]; unsigned at, arrivedAt; int driver; } RideReq;
+static RideReq g_rideReq[RIDE_REQS];
+static unsigned char g_rideDeliver[MAX_BOTS];   // a Pilot carrying a pickup's riders (an IFV / tank too: the taxi's delivery)
+static int ride_vehicle_ok(char *v)   // any ground vehicle of ours with 2+ free seats (the user): jeep, IFV, tank - no boats / air / AA
+{
+    int k = vehicle_kind(v);
+    return (k == VK_LIGHT || k == VK_IFV || k == VK_TANK) && !vehicle_is_mobile_aa(v) && vehicle_ok(v) && free_seat_count(v) >= 2;
+}
+static int ride_req_of_driver(int i)
+{
+    for (int r = 0; r < RIDE_REQS; r++) if (g_rideReq[r].caller && g_rideReq[r].driver == i) return r;
+    return -1;
+}
+static void ride_board_callers(int r, char *veh)
+{
+    char *cp = g_rideReq[r].caller;
+    int ci = bot_index(cp), sq = player_squad(cp), team = player_team(cp);
+    float *cpos = human_pos(cp);
+    if (ci < 0 || !cpos) return;   // (a human caller climbs in themselves)
+    float *vp0 = vehicle_pos(veh, NULL);
+    if (vp0 && dist2(vp0, cpos) > 70.0f * 70.0f) return;
+    for (int j = 0; j < H->botCount && free_seat_count(veh) > 0; j++) {
+        char *jp = H->bots[j], *js = *(char **)(jp + OFF_PLAYER_SOLDIER);
+        if (!js || player_vehicle(jp) || player_team(jp) != team || is_pilot(j) || is_aa_bot(j)) continue;
+        if (j != ci && (!sq || player_squad(jp) != sq || dist2((float *)(js + OFF_SOLDIER_POSITION), cpos) > 40.0f * 40.0f)) continue;
+        if (bot_enter_vehicle(j, veh) && g_rideReq[r].driver >= 0 && g_rideReq[r].driver < H->botCount)
+            assign_task(j, TASK_FOLLOW, H->bots[g_rideReq[r].driver]);   // (riding along with its driver - with no task a rider got out within 2 s)
+    }
+}
+static void ride_cancel(int r, const char *why, int negative)
+{
+    RideReq *q = &g_rideReq[r];
+    if (!strcmp(why, "aboard") && q->driver >= 0) g_rideDeliver[q->driver] = 1;
+    bot_log("ride: %s's pickup ends (%s)", player_exists(q->caller) ? q->caller + OFF_PLAYER_ONLINE_NAME : "?", why);
+    if (negative && player_exists(q->caller)) {   // the nearest team bot answers "Negative"
+        int team = player_team(q->caller), best = -1;
+        float bd = 80.0f;
+        for (int j = 0; j < H->botCount; j++) {
+            if (H->bots[j] == q->caller || player_team(H->bots[j]) != team || !*(char **)(H->bots[j] + OFF_PLAYER_SOLDIER)) continue;
+            float d = bot_distance_to(j, q->pos);
+            if (d < bd) { bd = d; best = j; }
+        }
+        if (best >= 0) bot_say_later(best, ORDER_NEGATIVE, SAY_DELAY_FRAMES);
+    }
+    memset(q, 0, sizeof *q);
+    q->driver = -1;
+}
+static void ride_request(char *caller, const float *p)
+{
+    int r = -1;
+    for (int k = 0; k < RIDE_REQS && r < 0; k++) if (g_rideReq[k].caller == caller) r = k;
+    if (r >= 0) { memcpy(g_rideReq[r].pos, p, 12); bot_log("ride: %s asks again - still on the board", caller + OFF_PLAYER_ONLINE_NAME); return; }
+    for (int k = 0; k < RIDE_REQS && r < 0; k++) if (!g_rideReq[k].caller) r = k;
+    if (r < 0) { bot_log("ride: the board is full - %s's pickup not taken", caller + OFF_PLAYER_ONLINE_NAME); return; }
+    RideReq *q = &g_rideReq[r];
+    q->caller = caller; memcpy(q->pos, p, 12); q->at = H->frame; q->arrivedAt = 0; q->driver = -1;
+    bot_log("ride: %s needs a pickup at (%.0f, %.0f)", caller + OFF_PLAYER_ONLINE_NAME, p[0], p[2]);
+}
+static void ride_tick(void)
+{
+    if (H->frame % 30 != 7) return;
+    for (int r = 0; r < RIDE_REQS; r++) {
+        RideReq *q = &g_rideReq[r];
+        if (!q->caller) continue;
+        char *cs = player_exists(q->caller) ? *(char **)(q->caller + OFF_PLAYER_SOLDIER) : NULL;
+        if (!cs) { ride_cancel(r, "the caller is gone / dead", 0); continue; }
+        char *cv = player_vehicle(q->caller);
+        char *dv = q->driver >= 0 && q->driver < H->botCount ? player_vehicle(H->bots[q->driver]) : NULL;
+        if (cv) { ride_cancel(r, cv == dv ? "aboard" : "found its own ride", 0); continue; }
+        float *cp = human_pos(q->caller);
+        if (cp) memcpy(q->pos, cp, 12);
+        if (q->driver >= 0) {
+            if (!dv || !*(char **)(H->bots[q->driver] + OFF_PLAYER_SOLDIER)) { ride_cancel(r, "the driver is lost", 1); continue; }
+            if (q->arrivedAt && H->frame - q->arrivedAt > RIDE_BOARD_FRAMES) ride_cancel(r, "nobody got in", 0);
+            continue;
+        }
+        if (H->frame - q->at > RIDE_WAIT_FRAMES) { ride_cancel(r, "no driver came in 60 s", 1); continue; }
+        int team = player_team(q->caller), best = -1, bestH = -1;
+        float bd = 1e30f, bdH = 1e30f;
+        for (int j = 0; j < H->botCount; j++) {
+            char *jp = H->bots[j], *v = player_vehicle(jp);
+            if (!v || jp == q->caller || player_team(jp) != team || !is_pilot(j) || (!g_drive[j].phase && !g_heliHold[j]) || ride_req_of_driver(j) >= 0) continue;
+            int heli = g_heliHold[j] && vehicle_kind(v) == VK_HELI;   // a transport helicopter (console-held for now)
+            if (heli && (g_heliRide[j] || !vehicle_ok(v) || free_seat_count(v) < 2)) continue;   // (a hunting Littlebird drops its attack for it)
+            if (!heli && (!ride_vehicle_ok(v) || g_rideDeliver[j])) continue;
+            int riders = 0;
+            for (int k = 0; k < H->botCount; k++) if (k != j && player_vehicle(H->bots[k]) == v) riders++;
+            if (riders) continue;
+            float *vp = vehicle_pos(v, NULL), d = vp ? dist2(vp, q->pos) : 1e30f;
+            if (heli) { if (d < bdH) { bdH = d; bestH = j; } }
+            else if (d < bd) { bd = d; best = j; }
+        }
+        if (bestH >= 0) { best = bestH; bd = bdH; }   // (the user: a transport helicopter / Littlebird answers before any tank)
+        if (best < 0) {
+            static unsigned waitLogAt[RIDE_REQS];
+            if (H->frame - waitLogAt[r] > 15 * 30) { waitLogAt[r] = H->frame; bot_log("ride: %s waits - no Pilot in a vehicle with 2+ free seats and no riders", q->caller + OFF_PLAYER_ONLINE_NAME); }
+            continue;
+        }
+        q->driver = best;
+        if (!g_heliHold[best]) { g_drive[best].phase = 8; g_drive[best].at = 0; }   // whatever it was driving to: the hold / taxi logic takes it to the caller now
+        bot_say_later(best, ORDER_ROGERTHAT, SAY_DELAY_FRAMES);
+        bot_log("ride: %s takes %s's pickup - Affirmative (%.0f m away)", H->bots[best] + OFF_PLAYER_ONLINE_NAME, q->caller + OFF_PLAYER_ONLINE_NAME, sqrtf(bd));
+        chat_say_team(team, "%s: %s, I'm on my way in a %s", H->bots[best] + OFF_PLAYER_ONLINE_NAME, q->caller + OFF_PLAYER_ONLINE_NAME,
+                      vehicle_name(player_vehicle(H->bots[best])));
+    }
+}
+// Stopping to let riders in (the user, 2026-10-15: it held "S" on a stale speed and reversed away from them): no input,
+// a touch of brake only while it is really still rolling - forward or back (the live hull movement, not the drive's estimate)
+static float veh_stop_input(int i, char *veh)
+{
+    static float lp[MAX_BOTS][3];
+    static unsigned la[MAX_BOTS];
+    float *m = vehicle_xf(veh), v = 0;
+    if (!m) return 0;
+    if (la[i] && H->frame > la[i] && H->frame - la[i] < 10) {
+        float hl = sqrtf(m[8] * m[8] + m[10] * m[10]) + 1e-6f, dt = (H->frame - la[i]) / 30.0f;
+        v = ((m[12] - lp[i][0]) * m[8] + (m[14] - lp[i][2]) * m[10]) / hl / dt;
+    }
+    lp[i][0] = m[12]; lp[i][1] = m[13]; lp[i][2] = m[14]; la[i] = H->frame;
+    return v > 1.5f ? -0.4f : v < -1.5f ? 0.4f : 0.0f;
+}
 static void pilot_ferry_tick(int i, DriveState *d, char *veh)
 {
     static char *grp[MAX_BOTS], *skip[MAX_BOTS][4];
@@ -11012,11 +12101,21 @@ static void pilot_ferry_tick(int i, DriveState *d, char *veh)
     if (!vp) return;
     int riders = 0, team = player_team(pl), best = -1;
     for (int j = 0; j < H->botCount; j++) if (j != i && player_vehicle(H->bots[j]) == veh) riders++;
+    int armour = vehicle_kind(veh) == VK_IFV || vehicle_kind(veh) == VK_TANK;
+    if (!riders && g_rideDeliver[i]) {   // carrying a pickup: a human aboard counts as a rider too
+        int anyone = 0;
+        char *pm = player_manager();
+        void **arr = pm ? *(void ***)(pm + 0xac) : NULL;
+        unsigned count = pm ? *(unsigned *)(pm + 8) : 0;
+        for (unsigned k = 0; k < count && k < 64; k++) if (arr[k] && (char *)arr[k] != pl && player_vehicle((char *)arr[k]) == veh) anyone = 1;
+        if (!anyone) { g_rideDeliver[i] = 0; bot_log("ride: %s's riders are out - back to its own job", pl + OFF_PLAYER_ONLINE_NAME); d->phase = 8; return; }
+        riders = 1;   // a human rider: deliver them
+    }
     float bd = 1e30f;
     for (int f = 0; f < g_flagCount; f++)
         if (flag_owner(f) != team && (f >= 16 || H->frame >= g_taxiNoFlagUntil[i][f])) { float q = dist2(flag_pos(f), vp); if (q < bd) { bd = q; best = f; } }
     if (best < 0 && (best = pilot_front_flag(i, team)) >= 0) bd = dist2(flag_pos(best), vp);   // all ours: to the front
-    if (!riders && !vehicle_is_boat(veh) && (H->frame + i) % 30 == 0 && pilot_heavy_free(i)) { pilot_leave_vehicle(i, veh, "a tank / jet is free"); return; }
+    // (no more leaving a jeep for a free tank / jet: a Pilot stays in its vehicle until it is destroyed - the user, 2026-10-15)
     if (vehicle_bad(veh)) {   // the drive gave up on it (keeps getting stuck / no road route): everyone out, on foot from here
         if (riders) { bot_say(i, ORDER_GETOUT); order_reaction(pl, ORDER_GETOUT, NULL); }
         pilot_leave_vehicle(i, veh, "the taxi keeps getting stuck / has no road");
@@ -11045,18 +12144,33 @@ static void pilot_ferry_tick(int i, DriveState *d, char *veh)
         }
         boatFor[i] = NULL;
     }
+    static unsigned firstIn[MAX_BOTS];
+    if (!riders) firstIn[i] = 0;
+    else if (!firstIn[i]) firstIn[i] = H->frame;
     if (riders > 0) {   // delivering
-        if (loadAt[i] && H->frame - loadAt[i] < 10 * 30 && free_seat_count(veh) > 0 && grp[i]) {   // still boarding
-            H->botMove[i][0] = d->speed > 0.5f ? -0.4f : 0.0f;
+        if (loadAt[i] && H->frame - firstIn[i] < 5 * 30 && free_seat_count(veh) > 0 && grp[i]) {   // still boarding: 5 s after the first got in
+            H->botMove[i][0] = veh_stop_input(i, veh);
             return;
         }
         loadAt[i] = 0; grp[i] = NULL;
-        if (best < 0) { pilot_leave_vehicle(i, veh, "no flag left to take"); return; }
+        if (best < 0) { H->botMove[i][0] = veh_stop_input(i, veh); return; }   // (no flag to take: holds - it stays in its vehicle)
         static int boatTo[MAX_BOTS];   // a boat: the flag it already sailed for (+1) - stopped again = landed: everyone out
         int landed = vehicle_is_boat(veh) && boatTo[i] == best + 1;
         if (vehicle_is_boat(veh) && !landed && H->frame >= d->at) boatTo[i] = best + 1;
         if (landed) boatTo[i] = 0;
+        if (bd < 60.0f * 60.0f || landed) {   // "Get out!" - its riders go, it keeps the vehicle (a Pilot stays in it until it is destroyed)
+            if (H->frame < d->at) { H->botMove[i][0] = veh_stop_input(i, veh); return; }
+            d->at = H->frame + 4 * 30;
+            H->botMove[i][0] = veh_stop_input(i, veh);
+            bot_say(i, ORDER_GETOUT);
+            order_reaction(pl, ORDER_GETOUT, NULL);
+            for (int j = 0; j < H->botCount; j++) if (j != i && player_vehicle(H->bots[j]) == veh) g_dropAt[j] = H->frame ? H->frame : 1;
+            bot_log("ride: %s drops its riders at flag %d - Get out!", pl + OFF_PLAYER_ONLINE_NAME, best);
+            return;
+        }
         if (bd < 60.0f * 60.0f || landed) {   // there: everyone out - the Pilot too
+            g_rideDeliver[i] = 0;
+            for (int j = 0; j < H->botCount; j++) if (j != i && player_vehicle(H->bots[j]) == veh) g_dropAt[j] = H->frame ? H->frame : 1;
             bot_say(i, ORDER_GETOUT);
             order_reaction(pl, ORDER_GETOUT, NULL);
             bot_log("pilot: %s drops %d rider(s) at flag %d and goes with them", pl + OFF_PLAYER_ONLINE_NAME, riders, best);
@@ -11069,12 +12183,36 @@ static void pilot_ferry_tick(int i, DriveState *d, char *veh)
         bot_log("pilot: %s drives %d rider(s) to flag %d (%.0f m)", pl + OFF_PLAYER_ONLINE_NAME, riders, best, sqrtf(bd));
         return;
     }
+    {   // on a pickup from the board: to the caller, "Get in!" beside them (the board ends it: aboard / given up)
+        int rq = ride_req_of_driver(i);
+        if (rq >= 0) {
+            RideReq *q = &g_rideReq[rq];
+            float qd = dist2(q->pos, vp);
+            if (qd > 22.0f * 22.0f && !q->arrivedAt) {
+                if (H->frame < d->at) return;
+                d->at = H->frame + 4 * 30;
+                pilot_drive_to(i, d, veh, q->pos, -1);
+                bot_log("ride: %s drives to pick up %s (%.0f m)", pl + OFF_PLAYER_ONLINE_NAME, q->caller + OFF_PLAYER_ONLINE_NAME, sqrtf(qd));
+                return;
+            }
+            H->botMove[i][0] = veh_stop_input(i, veh);
+            if (!q->arrivedAt) { q->arrivedAt = H->frame; callAt[i] = 0; bot_log("ride: %s is at %s's pickup", pl + OFF_PLAYER_ONLINE_NAME, q->caller + OFF_PLAYER_ONLINE_NAME); ride_board_callers(rq, veh); }
+            grp[i] = q->caller; loadAt[i] = H->frame;   // (once someone is aboard: 10 s more for the rest to get in)
+            if (H->frame >= callAt[i]) {
+                callAt[i] = H->frame + 4 * 30;
+                bot_say(i, ORDER_GETIN);
+                order_reaction(pl, ORDER_GETIN, NULL);
+            }
+            return;
+        }
+    }
     // empty: the nearest friendly bot on foot (not a Pilot, not one of the groups that would not board)
     char *nbot = NULL;
     float nd = 25.0f * 25.0f;   // earshot only: a taxi keeps to the roads and takes who is by it (the user, 2026-10-13)
     for (int j = 0; j < H->botCount; j++) {
         char *jp = H->bots[j], *js = *(char **)(jp + OFF_PLAYER_SOLDIER);
         if (j == i || !js || player_team(jp) != team || player_vehicle(jp) || is_pilot(j) || !bot_brain(j)->enabled || g_drive[j].phase) continue;
+        if (g_dropAt[j] && H->frame - g_dropAt[j] < 60 * 30) continue;
         int sk = 0;
         for (int k = 0; k < 4; k++) if (skip[i][k] == jp && H->frame < skipUntil[i][k]) sk = 1;
         if (sk) continue;
@@ -11082,8 +12220,7 @@ static void pilot_ferry_tick(int i, DriveState *d, char *veh)
         if (q < nd) { nd = q; nbot = jp; }
     }
     if (!nbot) {   // nobody to carry: to the nearest flag alone, out there
-        if (best < 0) { pilot_leave_vehicle(i, veh, "nothing to do with it"); return; }
-        if (bd < 60.0f * 60.0f) { pilot_leave_vehicle(i, veh, "at the flag - takes it on foot"); return; }
+        if (best < 0 || bd < 60.0f * 60.0f) { H->botMove[i][0] = veh_stop_input(i, veh); return; }   // (holds there - it stays in its vehicle)
         if (H->frame < d->at) return;
         d->at = H->frame + 3 * 30;
         pilot_drive_to(i, d, veh, flag_pos(best), best);
@@ -11100,7 +12237,7 @@ static void pilot_ferry_tick(int i, DriveState *d, char *veh)
         return;
     }
     // beside them: "Get in!" (10 s)
-    H->botMove[i][0] = d->speed > 0.5f ? -0.4f : 0.0f;
+    H->botMove[i][0] = veh_stop_input(i, veh);
     if (grp[i] != nbot || !loadAt[i]) { grp[i] = nbot; loadAt[i] = H->frame; callAt[i] = 0; }
     if (H->frame >= callAt[i]) {
         callAt[i] = H->frame + 4 * 30;
@@ -11115,11 +12252,354 @@ static void pilot_ferry_tick(int i, DriveState *d, char *veh)
         grp[i] = NULL; loadAt[i] = 0;
     }
 }
+static int veh_people(char *veh, char *except)   // everyone aboard (humans too), but one
+{
+    int n = 0;
+    char *pm = player_manager();
+    void **arr = pm ? *(void ***)(pm + 0xac) : NULL;
+    unsigned count = pm ? *(unsigned *)(pm + 8) : 0;
+    for (unsigned k = 0; k < count && k < 64; k++) if (arr[k] && (char *)arr[k] != except && player_vehicle((char *)arr[k]) == veh) n++;
+    return n;
+}
+// A landing zone by the caller (the user, 2026-10-15: it set down on the roof beside him): ground at the caller's own
+// level (within 2 m), flat and clear for the rotor (8 rays on a 7 m ring all within 1 m of the centre - walls, cars, trees
+// and roofs fail), 12-58 m from them, the nearest ~22 m preferred; then the direction the open ground runs longest (a road's
+// length) - the nose is lined up with it on the way in. 0: none found.
+static int heli_ray_ground(float x, float z, float top, float bottom, float *y)
+{
+    float a[3] = {x, top, z}, b[3] = {x, bottom, z}, h[3];
+    unsigned saved = g_rayFlags;
+    g_rayFlags = RAY_DONT_CHECK_CHARACTER;
+    int ok = ray_cast(a, b, h, NULL);
+    g_rayFlags = saved;
+    if (ok) *y = h[1];
+    return ok;
+}
+static int heli_find_lz(const float *cp, float *out)
+{
+    float cy = cp[1];
+    heli_ray_ground(cp[0], cp[2], cp[1] + 1.5f, cp[1] - 6.0f, &cy);   // the caller's ground
+    float top = cy + 60.0f, bottom = cy - 15.0f, bestScore = 1e30f;
+    int found = 0;
+    static const float rings[6] = {12, 20, 28, 36, 46, 58};
+    for (int r = 0; r < 6; r++)
+        for (int k = 0; k < 16; k++) {
+            float ang = 6.2831853f * k / 16.0f + r * 0.2f, x = cp[0] + sinf(ang) * rings[r], z = cp[2] + cosf(ang) * rings[r], gy;
+            if (!heli_ray_ground(x, z, top, bottom, &gy) || fabsf(gy - cy) > 2.0f) continue;   // a roof / ledge / ditch: not the caller's level
+            float spread = 0;
+            int ok = 1;
+            for (int s = 0; s < 8 && ok; s++) {
+                float sa = 0.7853982f * s, ry;
+                if (!heli_ray_ground(x + sinf(sa) * 7.0f, z + cosf(sa) * 7.0f, top, bottom, &ry) || fabsf(ry - gy) > 1.0f) ok = 0;
+                else spread = fmaxf(spread, fabsf(ry - gy));
+            }
+            if (!ok) continue;
+            float score = fabsf(rings[r] - 22.0f) + spread * 10.0f;
+            if (score < bestScore) { bestScore = score; out[0] = x; out[1] = gy; out[2] = z; found = 1; }
+        }
+    if (!found) return 0;
+    float bestLen = -1, bestA = 0;   // the long axis: how far the ground stays level (within 1 m) both ways, 8 directions
+    for (int d = 0; d < 8; d++) {
+        float a = 3.14159265f * d / 8.0f, len = 0;
+        for (int sgn = -1; sgn <= 1; sgn += 2)
+            for (float t = 2.0f; t <= 30.0f; t += 2.0f) {
+                float ry;
+                if (!heli_ray_ground(out[0] + sinf(a) * t * sgn, out[2] + cosf(a) * t * sgn, top, bottom, &ry) || fabsf(ry - out[1]) > 1.0f) break;
+                len += 2.0f;
+            }
+        if (len > bestLen) { bestLen = len; bestA = a; }
+    }
+    out[3] = bestA * 57.29578f;
+    bot_log("heliride: landing zone at (%.0f, %.1f, %.0f), %.0f m from the caller, level ground %.0f m long at %.0f deg",
+            out[0], out[1], out[2], sqrtf((out[0] - cp[0]) * (out[0] - cp[0]) + (out[2] - cp[2]) * (out[2] - cp[2])), bestLen, out[3]);
+    return 1;
+}
+static void heli_fly_to(int i, float x, float z, float y, int land)
+{
+    g_heliLzOk[i] = 0;
+    g_heliGo[i] = 1; g_heliGoal[i][0] = x; g_heliGoal[i][1] = z; g_heliAlt[i] = y;
+    g_heliLand[i] = land ? 1 : 0; g_heliLandAt[i] = H->frame; g_heliShift[i] = 0;
+}
+static void heli_go_home(int i, float groundY, const char *why)
+{
+    if (g_heliAuto[i]) {   // a hunter (attack / Littlebird): straight back to hunting and patrolling - only transports go home
+        char *v = player_vehicle(H->bots[i]);
+        float *m = v ? vehicle_xf(v) : NULL;
+        g_heliRide[i] = 0; g_rideDeliver[i] = 0; g_heliLand[i] = 0; g_heliGo[i] = 1;
+        if (m) { g_heliGoal[i][0] = m[12]; g_heliGoal[i][1] = m[14]; g_heliAlt[i] = m[13] - g_heliGroundH[i] + 60.0f; }
+        bot_log("heliride: %s - back to hunting (%s)", (char *)H->bots[i] + OFF_PLAYER_ONLINE_NAME, why);
+        return;
+    }
+    // home = its base at the HQ (the user, 2026-10-15: "home" was wherever it took the call - a random part of the map)
+    if (g_heliBaseOk[i]) { g_heliHome[i][0] = g_heliBase[i][0]; g_heliHome[i][1] = g_heliBase[i][1]; g_heliHome[i][2] = g_heliBase[i][2]; }
+    float hy = fmaxf(groundY, g_heliHome[i][1]) + 45.0f;
+    heli_fly_to(i, g_heliHome[i][0], g_heliHome[i][2], hy, 1);
+    if (g_heliBaseOk[i] == 2) { memcpy(g_heliLz[i], g_heliBase[i], sizeof g_heliLz[i]); g_heliLzOk[i] = 1; }
+    g_heliRide[i] = 6; g_rideDeliver[i] = 0;
+    bot_log("heliride: %s heads home (%s)", (char *)H->bots[i] + OFF_PLAYER_ONLINE_NAME, why);
+}
+static void heli_ride_tick(int i, char *veh)
+{
+    float *m = vehicle_xf(veh);
+    if (!m) return;
+    char *pl = H->bots[i];
+    const char *name = pl + OFF_PLAYER_ONLINE_NAME;
+    int team = player_team(pl), rq = ride_req_of_driver(i), people = veh_people(veh, pl);
+    float groundY = m[13] - HELI_SKID_H - g_heliGroundH[i];
+    float spd = sqrtf(g_heliVel[i][0] * g_heliVel[i][0] + g_heliVel[i][1] * g_heliVel[i][1]);
+    switch (g_heliRide[i]) {
+    case 0:
+        if (rq < 0) return;
+        {
+            RideReq *q = &g_rideReq[rq];
+            g_heliHome[i][0] = m[12]; g_heliHome[i][1] = m[13] - HELI_SKID_H - g_heliGroundH[i]; g_heliHome[i][2] = m[14];
+            if (!g_heliBaseOk[i]) {   // its base, once: the pad it sits on now - or, in the air, a landing zone by its HQ
+                float bz[4];
+                if (g_heliLand[i] == 4 || g_heliGroundH[i] < 1.0f) {
+                    g_heliBase[i][0] = m[12]; g_heliBase[i][1] = groundY; g_heliBase[i][2] = m[14]; g_heliBase[i][3] = atan2f(m[8], m[10]) * 57.29578f;
+                    g_heliBaseOk[i] = 1;
+                    bot_log("heliride: %s's base is its pad at (%.0f, %.0f)", name, m[12], m[14]);
+                } else if ((team == 1 || team == 2) && (g_hqPos[team][0] || g_hqPos[team][2]) && heli_find_lz(g_hqPos[team], bz)) {
+                    memcpy(g_heliBase[i], bz, sizeof bz); g_heliBaseOk[i] = 2;
+                    bot_log("heliride: %s's base is a landing zone by its HQ at (%.0f, %.0f)", name, bz[0], bz[2]);
+                }
+            }
+            float dx = m[12] - q->pos[0], dz = m[14] - q->pos[2], dl = sqrtf(dx * dx + dz * dz) + 1e-3f;
+            float tx = q->pos[0] + dx / dl * 25.0f, tz = q->pos[2] + dz / dl * 25.0f;   // (no zone found: 25 m short of them, on our side)
+            float lz[4];
+            int haveLz = heli_find_lz(q->pos, lz);
+            if (haveLz) { tx = lz[0]; tz = lz[2]; }
+            else bot_log("heliride: no level clear ground by %s - lands 25 m short of them", q->caller + OFF_PLAYER_ONLINE_NAME);
+            heli_fly_to(i, tx, tz, fmaxf(groundY, q->pos[1]) + 45.0f, 1);
+            if (haveLz) { memcpy(g_heliLz[i], lz, sizeof lz); g_heliLzOk[i] = 1; }
+            else g_heliShift[i] = 20.0f;   // no zone: it hovers low there for them to climb in - no sliding off away from them
+            g_heliRide[i] = 1;
+            bot_log("heliride: %s flies to pick up %s - lands at (%.0f, %.0f), %.0f m away", name, q->caller + OFF_PLAYER_ONLINE_NAME, tx, tz, dl);
+        }
+        return;
+    case 1:
+        if (people > 0) {   // climbed in while it hovered (the user, 2026-10-15: it took him home - "called off"): boarding
+            g_heliRide[i] = 3; g_heliRideAt[i] = H->frame;
+            bot_log("heliride: %s - the first one is aboard (it was still in the air), 5 s for the rest", name);
+            return;
+        }
+        if (rq < 0) { heli_go_home(i, groundY, "the pickup was called off"); return; }
+        if (g_heliLand[i] == 4) {
+            g_heliRide[i] = 2; g_rideReq[rq].arrivedAt = H->frame; g_heliCallAt[i] = 0;
+            ride_board_callers(rq, veh);
+            bot_log("heliride: %s is down at %s's pickup", name, g_rideReq[rq].caller + OFF_PLAYER_ONLINE_NAME);
+        }
+        return;
+    case 2:
+        if (people > 0) { g_heliRide[i] = 3; g_heliRideAt[i] = H->frame; bot_log("heliride: %s - the first one is aboard, 5 s for the rest", name); return; }
+        if (rq < 0) { heli_go_home(i, groundY, "nobody got in"); return; }
+        if (H->frame >= g_heliCallAt[i]) { g_heliCallAt[i] = H->frame + 4 * 30; bot_say(i, ORDER_GETIN); order_reaction(pl, ORDER_GETIN, NULL); }
+        return;
+    case 3:
+        if (!people) { heli_go_home(i, groundY, "they got out again"); return; }
+        if (H->frame - g_heliRideAt[i] < 5 * 30 && free_seat_count(veh) > 0) return;
+        {
+            int best = -1;
+            float bd = 1e30f;
+            for (int f = 0; f < g_flagCount; f++) if (flag_owner(f) != team) { float q = dist2(flag_pos(f), &m[12]); if (q < bd) { bd = q; best = f; } }
+            if (best < 0) best = pilot_front_flag(i, team);
+            if (best < 0) { heli_go_home(i, groundY, "no flag to take them to"); return; }
+            float *fp = flag_pos(best);
+            g_heliDropFlag[i] = best;
+            heli_fly_to(i, fp[0], fp[2], fmaxf(groundY, fp[1]) + 45.0f, 0);
+            g_heliRide[i] = 4;
+            bot_log("heliride: %s lifts off with %d aboard for flag %d (%.0f m)", name, people, best, sqrtf(bd));
+        }
+        return;
+    case 4:
+        if (!people) { heli_go_home(i, groundY, "nobody aboard any more"); return; }
+        {
+            float *fp = flag_pos(g_heliDropFlag[i]);
+            float dx = fp[0] - m[12], dz = fp[2] - m[14];
+            if (dx * dx + dz * dz < 15.0f * 15.0f && spd < 4.0f) {
+                g_heliRide[i] = 5; g_heliRideAt[i] = H->frame; g_heliCallAt[i] = 0;
+                bot_log("heliride: %s is over flag %d, %.0f m up - Get out!", name, g_heliDropFlag[i], g_heliGroundH[i]);
+            }
+        }
+        return;
+    case 5:
+        if (!people || H->frame - g_heliRideAt[i] > 15 * 30) { heli_go_home(i, groundY, people ? "15 s over the flag" : "everyone is out"); return; }
+        if (H->frame >= g_heliCallAt[i]) {
+            g_heliCallAt[i] = H->frame + 4 * 30;
+            for (int j = 0; j < H->botCount; j++) if (j != i && player_vehicle(H->bots[j]) == veh) g_dropAt[j] = H->frame ? H->frame : 1;
+            bot_say(i, ORDER_GETOUT);
+            order_reaction(pl, ORDER_GETOUT, NULL);
+        }
+        return;
+    case 6:
+        if (g_heliLand[i] == 4) { g_heliRide[i] = 0; bot_log("heliride: %s is home - free for the next pickup", name); }
+        return;
+    }
+}
+static void heli_auto_tick(int i, char *veh)
+{
+    if (!g_heliAuto[i]) return;
+    char *pl = H->bots[i];
+    const char *name = pl + OFF_PLAYER_ONLINE_NAME;
+    float *m = vehicle_xf(veh);
+    if (!m) return;
+    if (g_heliRide[i]) { if (g_heliAtk[i]) g_heliAtk[i] = 0; return; }   // on a pickup: that first
+    float alt = m[13];
+    // (a pass goes on into the next from the other side - the through / turn legs are its cool-down, open to pickups; the
+    // user, 2026-10-15. A new target only once this one is down)
+    if (g_heliAtk[i]) return;
+    if (!g_heliAtkNW[i]) heli_find_pods(i, veh);
+    if (heli_pod_rounds(i) == 0 || heli_pod_rounds(i) == 1) {   // still reloading / cooling
+        static unsigned waitAt[MAX_BOTS];
+        if (H->frame >= waitAt[i]) {
+            waitAt[i] = H->frame + 5 * 30;
+            int k = g_heliAtkPod[i];
+            bot_log("heliauto: %s waits for its gun (state %d, heat %.2f, rounds %d)", name, heli_pod_rounds(i),
+                    k >= 0 ? vweapon_heat(g_heliAtkW[i][k]) : -1.0f, k >= 0 ? vweapon_rounds(g_heliAtkW[i][k]) : -1);
+        }
+        return;
+    }
+    if (H->frame < g_heliAutoScanAt[i]) return;
+    g_heliAutoScanAt[i] = H->frame + 30;
+    // the nearest enemy it can see within 1 km: on foot, ground vehicles; helicopters only with a minigun; never jets
+    int team = player_team(pl), mgun = g_heliAtkNW[i] && g_heliAtkHeat[i][g_heliAtkPod[i] >= 0 ? g_heliAtkPod[i] : 0];
+    char *pm = player_manager(), *best = NULL;
+    void **arr = pm ? *(void ***)(pm + 0xac) : NULL;
+    unsigned count = pm ? *(unsigned *)(pm + 8) : 0;
+    float bd = 1000.0f * 1000.0f;
+    for (unsigned k = 0; k < count && k < 64; k++) {
+        char *p = arr[k];
+        if (!p || p == pl) continue;
+        int t = player_team(p);
+        if ((t != 1 && t != 2) || t == team) continue;
+        char *tv = player_vehicle(p), *ts = *(char **)(p + OFF_PLAYER_SOLDIER);
+        float *tp = tv ? vehicle_pos(tv, NULL) : ts ? (float *)(ts + OFF_SOLDIER_POSITION) : NULL;
+        if (!tp) continue;
+        if (!tv && *(float *)(ts + OFF_SOLDIER_HEALTH) <= 0) continue;
+        if (tv) { int kd = vehicle_kind(tv); if (kd == VK_JET || (kd == VK_HELI && !mgun)) continue; }
+        float q = dist2(tp, &m[12]) + (tp[1] - alt) * (tp[1] - alt);
+        if (q >= bd) continue;
+        float a3[3] = {m[12], alt - 3.0f, m[14]}, b3[3] = {tp[0], tp[1] + 1.5f, tp[2]}, h3[3];
+        unsigned saved = g_rayFlags;
+        g_rayFlags = RAY_DONT_CHECK_CHARACTER;
+        int hit = ray_cast(a3, b3, h3, NULL);
+        g_rayFlags = saved;
+        if (hit && dist2(h3, tp) > 6.0f * 6.0f) continue;   // something between (a vehicle target's own hull is fine)
+        bd = q; best = p;
+    }
+    if (!best) {   // nothing in sight: patrol a circle round the middle of the flags (the user: over the middle of the map, looking
+        // for targets and listening for pickups) - 300 m out, 80 m over the ground, 45 degrees ahead round it each leg
+        if (!g_flagCount) return;
+        float cx = 0, cz = 0;
+        for (int q = 0; q < g_flagCount; q++) { cx += flag_pos(q)[0]; cz += flag_pos(q)[2]; }
+        cx /= g_flagCount; cz /= g_flagCount;
+        float a = atan2f(m[12] - cx, m[14] - cz) + 0.785f;
+        g_heliGo[i] = 1; g_heliLand[i] = 0;
+        g_heliGoal[i][0] = cx + sinf(a) * 300.0f; g_heliGoal[i][1] = cz + cosf(a) * 300.0f;
+        g_heliAlt[i] = alt - g_heliGroundH[i] + 80.0f;
+        static unsigned patrolLogAt[MAX_BOTS];
+        if (H->frame >= patrolLogAt[i]) { patrolLogAt[i] = H->frame + 15 * 30; bot_log("heliauto: %s sees nobody - patrols round the middle of the map", name); }
+        return;
+    }
+    g_heliAtkTgt[i] = best; g_heliAtk[i] = 1; g_heliPlanned[i] = 0;
+    memset(g_heliAtkLast[i], 0, sizeof g_heliAtkLast[i]); memset(g_heliAtkVel[i], 0, sizeof g_heliAtkVel[i]);
+    bot_log("heliauto: %s goes after %s (%.0f m)", name, best + OFF_PLAYER_ONLINE_NAME, sqrtf(bd));
+}
+// Bots on a long walk ask for a ride (the user, 2026-10-15: at the start of a big map only one squad took the jeep, the rest
+// walked): on foot, its objective flag over 350 m away, not fighting, a possible driver on its team (a Pilot in a vehicle
+// with 2+ free seats / a held helicopter), no squadmate within 30 m already on the board - "Need pickup"; once in 90 s.
+static unsigned g_rideCallAt[MAX_BOTS];
+// Waiting for it (the user: in cover until the ride is there, then meet it): a driver on its way to this bot's / a squadmate's
+// (within 40 m) call - hold a post where it stands (crouched, it still fights); released when the call ends
+static void ride_wait_tick(int i)
+{
+    if ((H->frame + i * 5) % 30) return;
+    char *pl = H->bots[i], *s = *(char **)(pl + OFF_PLAYER_SOLDIER);
+    BotBrain *b = bot_brain(i);
+    int wait = 0;
+    if (s && b->enabled && !player_vehicle(pl) && !is_pilot(i)) {
+        float *me = (float *)(s + OFF_SOLDIER_POSITION);
+        for (int r = 0; r < RIDE_REQS && !wait; r++) {
+            RideReq *q = &g_rideReq[r];
+            if (!q->caller || q->driver < 0 || q->arrivedAt || player_team(q->caller) != player_team(pl)) continue;
+            if (q->caller == pl || (player_squad(pl) && player_squad(q->caller) == player_squad(pl) && dist2(q->pos, me) < 40.0f * 40.0f)) wait = 1;
+        }
+        if (wait && !g_rideWait[i]) {
+            g_rideWait[i] = 1;
+            b->task = TASK_DEFEND; b->taskUntil = NEVER; memcpy(b->postPos, me, sizeof b->postPos); b->postFacing = 0; b->crouched = 0;
+            b->stepAt = 0; b->enroute = b->waiting = 0; b->replanAt = 0;
+            bot_log("ride: %s waits for its ride, holding where it is", pl + OFF_PLAYER_ONLINE_NAME);
+        }
+    }
+    if (!wait && g_rideWait[i]) {
+        g_rideWait[i] = 0;
+        if (b->task == TASK_DEFEND) { b->task = TASK_NONE; b->enroute = b->waiting = 0; b->crouched = 0; }
+    }
+}
+static void ride_call_tick(int i)
+{
+    ride_wait_tick(i);
+    if ((H->frame + i * 11) % 60) return;
+    char *pl = H->bots[i], *s = *(char **)(pl + OFF_PLAYER_SOLDIER);
+    BotBrain *b = bot_brain(i);
+    if (!s || !b->enabled || player_vehicle(pl) || is_pilot(i) || is_aa_bot(i) || g_drive[i].phase || g_fightTarget[i]) return;
+    if (H->frame - g_rideCallAt[i] < 90 * 30 && g_rideCallAt[i]) return;
+    if (b->targetFlag < 0 || b->targetFlag >= g_flagCount) return;
+    float *me = (float *)(s + OFF_SOLDIER_POSITION);
+    if (dist2(flag_pos(b->targetFlag), me) < 350.0f * 350.0f) return;
+    int team = player_team(pl), driver = 0;
+    for (int j = 0; j < H->botCount && !driver; j++) {
+        char *v = player_vehicle(H->bots[j]);
+        if (!v || player_team(H->bots[j]) != team || !is_pilot(j) || ride_req_of_driver(j) >= 0) continue;
+        if (g_heliHold[j] ? (vehicle_kind(v) == VK_HELI && !g_heliRide[j] && free_seat_count(v) >= 2) : (g_drive[j].phase && ride_vehicle_ok(v))) driver = 1;
+    }
+    if (!driver) return;
+    for (int r = 0; r < RIDE_REQS; r++) {   // a squadmate nearby already asked
+        char *q = g_rideReq[r].caller;
+        if (q && player_team(q) == team && dist2(g_rideReq[r].pos, me) < 30.0f * 30.0f) return;
+    }
+    g_rideCallAt[i] = H->frame ? H->frame : 1;
+    bot_say(i, ORDER_REQUESTRIDE);
+    ride_request(pl, me);
+    bot_log("ride: %s is %.0f m from flag %d on foot - asks for a pickup", pl + OFF_PLAYER_ONLINE_NAME, sqrtf(dist2(flag_pos(b->targetFlag), me)), b->targetFlag);
+}
+// An aircraft of ours has stood unused 60 s and no Pilot is free to choose it (the user: the jets never died, the helicopters
+// sat at the HQ all game - every Pilot was in a tank): every 30 s, the nearest Pilot within 400 m in a tank / IFV / jeep with
+// nobody aboard gets out - its next pick is the idle aircraft (the idle claim)
+static void aircraft_pull_tick(void)
+{
+    if (H->frame % (30 * 30) != 15) return;
+    char **vs;
+    int nv = vehicle_list(&vs);
+    for (int t = 1; t <= 2; t++) {
+        int freeP = 0;
+        for (int j = 0; j < H->botCount; j++) if (is_pilot(j) && player_team(H->bots[j]) == t && *(char **)(H->bots[j] + OFF_PLAYER_SOLDIER) && !player_vehicle(H->bots[j])) freeP = 1;
+        if (freeP) continue;   // (one on foot will choose it)
+        for (int k = 0; k < nv; k++) {
+            char *a = vs[k];
+            if (!vehicle_ok(a) || !ride_is_air(vehicle_kind(a)) || !driver_seat_free(a) || !pilot_ride_ours(a, t) || jet_idle_frames(a) < 60 * 30) continue;
+            float *ap = vehicle_pos(a, NULL);
+            int best = -1;
+            float bd = 400.0f * 400.0f;
+            for (int j = 0; j < H->botCount; j++) {
+                char *v = player_vehicle(H->bots[j]);
+                if (!v || !is_pilot(j) || player_team(H->bots[j]) != t || ride_is_air(vehicle_kind(v)) || veh_people(v, H->bots[j]) || ride_req_of_driver(j) >= 0 || g_rideDeliver[j] || !ap) continue;   // (never one on a pickup)
+                float *vp = vehicle_pos(v, NULL), d = vp ? dist2(vp, ap) : 1e30f;
+                if (d < bd) { bd = d; best = j; }
+            }
+            if (best < 0) continue;
+            bot_log("pilot: %s's %s has stood unused %.0f s - %s leaves its %s for it", t == 1 ? "US" : "RU", vehicle_name(a), jet_idle_frames(a) / 30.0f,
+                    H->bots[best] + OFF_PLAYER_ONLINE_NAME, vehicle_name(player_vehicle(H->bots[best])));
+            pilot_leave_vehicle(best, player_vehicle(H->bots[best]), "an idle aircraft needs a Pilot");
+            break;   // (one a team per round of checks)
+        }
+    }
+}
 static void pilot_hold_tick(int i, DriveState *d)
 {
     char *pl = H->bots[i], *veh = player_vehicle(pl);
     H->botMove[i][1] = H->botMove[i][2] = 0;
-    H->botMove[i][0] = d->speed > 0.5f ? -0.4f : 0.0f;   // brake to a stop (a still gun shoots straight)
+    H->botMove[i][0] = veh ? veh_stop_input(i, veh) : 0.0f;   // stop (a still gun shoots straight) - live movement, not a stale speed
     // with a target: pivot the hull to face it - the front armour towards the enemy (the turret aims on its own)
     if (veh && g_gunWeapon[i] && (g_gunTarget[i] || g_gunTargetVeh[i])) {
         float *hx = vehicle_xf(veh);
@@ -11132,7 +12612,12 @@ static void pilot_hold_tick(int i, DriveState *d)
     }
     if (!veh) { d->phase = 0; d->veh = NULL; g_driving[i] = 0; return; }
     d->veh = veh;
-    { int vk = vehicle_kind(veh); if ((vk == VK_LIGHT || vk == VK_BOAT) && vehicle_ok(veh) && !vehicle_is_mobile_aa(veh)) { pilot_ferry_tick(i, d, veh); return; } }   // a taxi
+    { int vk = vehicle_kind(veh); if ((vk == VK_LIGHT || vk == VK_BOAT || ride_req_of_driver(i) >= 0 || g_rideDeliver[i]) && vehicle_ok(veh) && !vehicle_is_mobile_aa(veh)) { pilot_ferry_tick(i, d, veh); return; } }   // a taxi (or a pickup)
+    if (d->pickupUntil) {   // riders called in as it got in: wait for them (15 s at most), go once they are aboard
+        float *pvp = vehicle_pos(veh, NULL);
+        if (pvp && drive_pickup(i, d, pvp)) { H->botMove[i][0] = 0; return; }
+        d->at = H->frame;
+    }
     if (H->frame < d->at || !vehicle_ok(veh)) return;
     d->at = H->frame + 8 * 30;
     float *vp = vehicle_pos(veh, NULL);
@@ -11285,6 +12770,17 @@ static void drive_tick(int i)
         if (seat == 0 && is_pilot(i)) {   // a Pilot in a tank / IFV: straight to its flags (pilot_hold_tick decides)
             g_driving[i] = 1; d->phase = 8; d->at = H->frame + (unsigned)(i % 6) * 75;   // (leaving the HQ in turn: they jammed)
             bot_log("pilot: %s takes the %s", pl + OFF_PLAYER_ONLINE_NAME, vehicle_name(d->veh));
+            int vk = vehicle_kind(d->veh);
+            if (vk == VK_TANK || vk == VK_IFV) {   // "Get in!" the moment it is in (the user, 2026-10-15: said seconds later, the
+                float *vp = vehicle_pos(d->veh, NULL);   // bots by it had walked off) - the wait for them counts from the call
+                int team = player_team(pl), best = -1;
+                float bd = 1e30f;
+                for (int f = 0; f < g_flagCount; f++) if (flag_owner(f) != team && vp) { float q = dist2(flag_pos(f), vp); if (q < bd) { bd = q; best = f; } }
+                if (vp && best >= 0) {
+                    memcpy(d->goal, flag_pos(best), 12);
+                    if (drive_pickup(i, d, vp) && d->pickupUntil > d->at) d->at = d->pickupUntil;
+                }
+            }
             return;
         }
         if (seat == 0) { g_driving[i] = 1; d->phase = 6; d->at = H->frame; bot_log("drive: %s takes the wheel of the %s", pl + OFF_PLAYER_ONLINE_NAME, vehicle_name(d->veh)); }
@@ -11335,6 +12831,8 @@ static void drive_tick(int i)
         return;
     }
     if (player_vehicle(pl) != d->veh) { drive_stop(i, "is out of the vehicle", 20); return; }
+    if (d->phase == 2 && !d->boardAt && is_pilot(i)) d->boardAt = 1;   // a Pilot: called once as it got in - not at every leg (it
+                                                                        // called the troops it had just dropped back in, 2026-10-15)
     if (d->phase == 2 && !d->boardAt) {   // "Get in!" - teammates nearby take the free seats; 3 s to climb in
         d->boardAt = H->frame ? H->frame : 1;
         bot_say(i, ORDER_GETIN);
@@ -11562,8 +13060,12 @@ static void drive_tick(int i)
         return;
     }
     // driving
-    if (H->frame - d->at > 180 * 30) { drive_stop(i, "took too long - gets out", 30); return; }
-    {
+    // (a Pilot stays in its vehicle until it is destroyed - the user, 2026-10-15: a long drive is re-planned, a wreck ridden out)
+    if (H->frame - d->at > 180 * 30) {
+        if (is_pilot(i)) { d->phase = 8; d->at = H->frame; bot_log("drive: %s - a long drive: re-plans from here", pl + OFF_PLAYER_ONLINE_NAME); return; }
+        drive_stop(i, "took too long - gets out", 30); return;
+    }
+    if (!is_pilot(i)) {
         VehTrack *t = vehicle_sample(d->veh);
         float hp = *(float *)(d->veh + OFF_VEHICLE_HEALTH), mx = t && t->maxSeen > 0 ? t->maxSeen : 0;
         if (mx > 0 && hp < 0.1f * mx) { drive_stop(i, "bails out - the vehicle is nearly wrecked", 20); return; }
@@ -12000,6 +13502,12 @@ __declspec(dllexport) void botmod_tick(void)
         ((SetLevel_t)ADDR_ENTRYINPUT_SET_LEVEL)(in, EIA_YAW, H->botMove[i][2]);
         ((SetFloat_t)ADDR_ENTRYINPUT_SET_DT)(in, BOT_TICK_DT);
         apply_presses(i, in);
+        {   // the first tick after a core reload: let go of the trigger - a press held across the reload was never released (its
+            // count lives in this DLL, the level in the vehicle's input): a Littlebird's minigun fired on and on, 2026-10-15
+            static unsigned char released[MAX_BOTS];
+            if (!released[i]) { released[i] = 1; int held = 0; for (int k = 0; k < MAX_PRESSES; k++) if (g_press[i][k].frames > 0 && g_press[i][k].action == EIA_FIRE) held = 1;
+                                if (!held) ((SetLevel_t)ADDR_ENTRYINPUT_SET_LEVEL)(in, EIA_FIRE, 0.0f); }
+        }
         if (H->frame < g_sprintUntil[i]) { *(unsigned *)((char *)in + OFF_INPUT_FLAGS_A) |= SPRINT_BIT_A; *(unsigned *)((char *)in + OFF_INPUT_FLAGS_B) |= SPRINT_BIT_B; }
         else { *(unsigned *)((char *)in + OFF_INPUT_FLAGS_A) &= ~SPRINT_BIT_A; *(unsigned *)((char *)in + OFF_INPUT_FLAGS_B) &= ~SPRINT_BIT_B; }
         {   // repairing: trigger held down continuously while in contact with the vehicle, released the moment that ends
@@ -12144,7 +13652,7 @@ __declspec(dllexport) void botmod_tick(void)
         g_whereBot = i;
         g_where = "brain_tick";
         double a = perf_now();
-        if (level_ready()) { if (i == 0) { jet_idle_tick(); pilot_status_tick(); } pilot_pickup_tick(i); pilot_air_tick(i); }
+        if (level_ready()) { if (i == 0) { jet_idle_tick(); pilot_status_tick(); ride_tick(); } pilot_pickup_tick(i); pilot_air_tick(i); ride_call_tick(i); }
         if (g_pilotWaiting[i]) { bot_nav(i)->mode = 0; H->botMove[i][0] = H->botMove[i][1] = H->botMove[i][2] = 0; }   // at the HQ for a ride
         if (((H->frame + i) & 1) == 0 && !g_drive[i].phase && !g_flying[i] && !g_pilotWaiting[i]) {   // each bot thinks every other frame (15 Hz), alternating halves
             brain_tick(i);
@@ -12227,6 +13735,47 @@ static void msl_set_target(char *o, char *veh)   // what 00e6d1c0 does with a la
 static int msl_alive(char *o)
 {
     return o && !IsBadReadPtr(o, 0x290) && *(unsigned *)o == MSL_VT_PRIMARY && *(unsigned *)(o + 0x1d0) == MSL_VT_1D0;
+}
+// Where a strafing run's rockets land (dead reckoning from the pod: the rocket object keeps a live velocity, no position):
+// logged as the miss from the target - short / long along the line of fire, left / right across it
+static void rkt_note(char *o, int bot)
+{
+    int s = -1;
+    for (int k = 0; k < RKT_MAX; k++) if (g_rkt[k].obj == o) return; else if (!g_rkt[k].obj && s < 0) s = k;
+    if (s < 0) return;
+    char *v = player_vehicle(H->bots[bot]);
+    float *m = v ? vehicle_xf(v) : NULL;
+    if (!m) return;
+    g_rkt[s].obj = o; g_rkt[s].bot = bot; g_rkt[s].at = H->frame;
+    g_rkt[s].pos[0] = m[12] + m[8] * 3.0f; g_rkt[s].pos[1] = m[13] + m[9] * 3.0f - 1.0f; g_rkt[s].pos[2] = m[14] + m[10] * 3.0f;   // (the pods: just ahead, low)
+}
+static void rkt_tick(void)
+{
+    static unsigned logAt;
+    for (int k = 0; k < RKT_MAX; k++) {
+        char *o = g_rkt[k].obj;
+        if (!o) continue;
+        int b = g_rkt[k].bot;
+        if (msl_alive(o) && H->frame - g_rkt[k].at < 10 * 30) {
+            float *v = (float *)(o + MSL_OFF_VEL);
+            for (int q = 0; q < 3; q++) g_rkt[k].pos[q] += v[q] / 30.0f;
+            continue;
+        }
+        g_rkt[k].obj = NULL;   // gone: it hit something here
+        if (b < 0 || b >= H->botCount || !g_heliAtkTgt[b] || !player_exists(g_heliAtkTgt[b]) || H->frame == logAt) continue;
+        char *tp = g_heliAtkTgt[b], *tv = player_vehicle(tp), *ts = *(char **)(tp + OFF_PLAYER_SOLDIER);
+        float *t = tv ? vehicle_pos(tv, NULL) : ts ? (float *)(ts + OFF_SOLDIER_POSITION) : NULL;
+        char *hv = player_vehicle(H->bots[b]);
+        float *m = hv ? vehicle_xf(hv) : NULL;
+        if (!t || !m) continue;
+        logAt = H->frame;
+        float lx = t[0] - m[12], lz = t[2] - m[14], ll = sqrtf(lx * lx + lz * lz) + 1e-3f; lx /= ll; lz /= ll;   // the line of fire
+        float ex = g_rkt[k].pos[0] - t[0], ez = g_rkt[k].pos[2] - t[2];
+        float along = ex * lx + ez * lz, across = ex * lz - ez * lx;
+        bot_log("rocket: %s's lands %.0f m from %s - %.0f m %s, %.0f m %s, %.1f m %s", (char *)H->bots[b] + OFF_PLAYER_ONLINE_NAME, sqrtf(ex * ex + ez * ez),
+                tp + OFF_PLAYER_ONLINE_NAME, fabsf(along), along > 0 ? "long" : "short", fabsf(across), across > 0 ? "left" : "right",
+                fabsf(g_rkt[k].pos[1] - t[1]), g_rkt[k].pos[1] > t[1] ? "above its feet" : "below its feet");
+    }
 }
 // msldebug: one line per new missile-class object (speed, target position), then every dword in it that points at a
 // player, its soldier or its vehicle (or inside the first 0x1000 bytes of one) - to find where a missile keeps its target
@@ -12320,6 +13869,29 @@ static void missile_tick(void)
                 }
         }
         if (g_mslDebug && !g_msl[k].dumped && H->frame - g_msl[k].seen >= 3) { g_msl[k].dumped = 1; msl_debug_dump(o); }
+        if (H->frame - g_msl[k].seen == 0 && g_rktBot >= 0 && g_rktBot < H->botCount && H->frame - g_rktAt < 4) rkt_note(o, g_rktBot);
+        if (g_mslPosHunt) {   // a snapshot at frame 3, again at 8: three floats that moved by velocity x time = the position
+            static unsigned char snap[MSL_MAX][0x290];
+            unsigned age = H->frame - g_msl[k].seen;
+            if (age == 3) memcpy(snap[k], o, 0x290);
+            if (age == 8) {
+                float *v = (float *)(o + MSL_OFF_VEL), dt = 5.0f / 30.0f;
+                if (v[0] * v[0] + v[1] * v[1] + v[2] * v[2] > 50.0f * 50.0f) {
+                    int bo[3] = {-1, -1, -1}; float be[3] = {1e30f, 1e30f, 1e30f};
+                    for (int off = 0; off + 12 <= 0x290; off += 4) {
+                        float *a = (float *)(snap[k] + off), *b = (float *)(o + off), e = 0;
+                        for (int q = 0; q < 3; q++) { float d = (b[q] - a[q]) - v[q] * dt; e += d * d; }
+                        if (!(e < 1e29f) || fabsf(b[0]) > 1e5f || fabsf(b[2]) > 1e5f) continue;
+                        for (int r = 0; r < 3; r++) if (e < be[r]) { for (int s = 2; s > r; s--) { be[s] = be[s - 1]; bo[s] = bo[s - 1]; } be[r] = e; bo[r] = off; break; }
+                    }
+                    for (int r = 0; r < 3; r++) if (bo[r] >= 0) {
+                        float *a = (float *)(snap[k] + bo[r]), *b = (float *)(o + bo[r]);
+                        bot_log("mslpos: %p +%x err %.2f moved (%.1f %.1f %.1f) for v*dt (%.1f %.1f %.1f) now (%.0f %.0f %.0f)", o, bo[r], sqrtf(be[r]),
+                                b[0] - a[0], b[1] - a[1], b[2] - a[2], v[0] * dt, v[1] * dt, v[2] * dt, b[0], b[1], b[2]);
+                    }
+                }
+            }
+        }
         if (g_msl[k].warned || H->frame - g_msl[k].seen < 2) continue;   // (its target is filled in after construction)
         float *tp = (float *)(o + MSL_OFF_TGTPOS);
         if (!(fabsf(tp[0]) < 1e5f && fabsf(tp[1]) < 1e5f && fabsf(tp[2]) < 1e5f) || (tp[0] == 0 && tp[2] == 0)) {

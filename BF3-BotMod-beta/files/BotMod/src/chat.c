@@ -373,6 +373,20 @@ int chat_poll(char *who, int whoLen, char *text, int textLen)
     return have;
 }
 
+void chat_say_team(int team, const char *fmt, ...)   // admin.say to one team only
+{
+    if (!g_thread) return;
+    char msg[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+    for (char *t = msg; *t; t++) if (*t == '\t') *t = ' ';
+    EnterCriticalSection(&g_lock);
+    int next = (g_outHead + 1) % QUEUE_LEN;
+    if (next != g_outTail) { snprintf(g_out[g_outHead], LINE_LEN, "admin.say\t%.120s\tteam\t%d", msg, team); g_outHead = next; }
+    LeaveCriticalSection(&g_lock);
+}
 void chat_say(const char *fmt, ...)
 {
     if (!g_thread) return;

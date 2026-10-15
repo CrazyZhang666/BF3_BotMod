@@ -2,9 +2,16 @@
 # <class|*> perk <asset>   - the kit's specialization (perk)
 # <class|*> unlock <asset> - one more unlock for the kit (vehicle unlocks: e.g. the jet flare launcher)
 Engineer 1 Weapons/Gadgets/M15/U_M15
+Recon 3 Weapons/Gadgets/Claymore/U_Claymore
+Support:1 1 Weapons/FIM92A/U_FIM92
+Support:2 1 Weapons/SA18IGLA/U_SA18IGLA
 * perk Persistence/Unlocks/Soldiers/Specializations/AmmoBoostL1
 * unlock Persistence/Unlocks/Vehicles/JetFlareLauncher
 * unlock Persistence/Unlocks/Vehicles/JetHeatseekerStance
+* unlock Persistence/Unlocks/Vehicles/AtkHeliHeatseekerMissile
+* unlock Persistence/Unlocks/Vehicles/AtkHeliFlareLauncher
+* unlock Persistence/Unlocks/Vehicles/ScoutAAMissile
+* unlock Persistence/Unlocks/Vehicles/ScoutFlares
 * unlock Persistence/Unlocks/Vehicles/MbtSmokeLaunchers
 * unlock Persistence/Unlocks/Vehicles/IfvSmokeLaunchers
 * unlock Persistence/Unlocks/Vehicles/AavSmokeLaunchers
