@@ -28,6 +28,11 @@ static const int kDir[8][2] = {{1, 0}, {1, 1}, {0, 1}, {-1, 1}, {-1, 0}, {-1, -1
 static const unsigned char *g_pathMask;   // vehicles: only these nodes (NULL = soldiers)
 static int g_longLegs;                    // boats: straight lines across open water
 void nav_set_long_legs(int on) { g_longLegs = on; }
+// Partial routes (boats, 2026-10-19: Noshahr's flag 0 sits behind a quay wall the water map counted as shallows - every boat
+// route to it searched the whole sea and failed): when the goal cannot be reached, the route to the explored node nearest it.
+static int g_partialOk, g_partialUsed;
+void nav_set_partial(int on) { g_partialOk = on; g_partialUsed = 0; }
+int nav_partial_used(void) { return g_partialUsed; }
 void nav_set_path_mask(const unsigned char *mask) { g_pathMask = mask; }
 static float g_vehHalf = 1.5f;   // vehicles: half the width kept clear on a straight short cut
 static float g_hMul = 1.0f;      // the taxi map's dear off-street classes made A* search 60000 nodes on Karkand: greedier there
@@ -1442,11 +1447,18 @@ int nav_find_path(const NavGrid *g, NavRayFn ray, float sx, float sy, float sz, 
     int maxExpanded = 60000;   // (an unreachable goal used to search a whole big map - ~100 ms - and bots retried every second)
     gs[start] = 0; from[start] = -1; stamp[start] = curStamp;
     heap_push(heap, &hn, 0, start);
+    int nearNode = -1;   // (partial routes: the closed node nearest the goal)
+    float nearH = 1e30f;
     while (hn > 0) {
         int cur = heap_pop(heap, &hn).node;
         if (CLOSED(cur)) continue;
         if (cur == goal) { found = 1; break; }
         stamp[cur] = curStamp + 1;
+        if (g_partialOk) {
+            int qx = abs(gx - (cur / L) % g->w), qz = abs(gz - (cur / L) / g->w);
+            float qh = (float)(qx > qz ? qx + 0.4142f * qz : qz + 0.4142f * qx);
+            if (qh < nearH) { nearH = qh; nearNode = cur; }
+        }
         if (++closedCount > maxExpanded) break;   // unreachable goals would otherwise search the whole grid
         for (int d = 0; d < 8; d++) {
             int nb = step_node(g, cur, d);
@@ -1506,6 +1518,7 @@ int nav_find_path(const NavGrid *g, NavRayFn ray, float sx, float sy, float sz, 
     }
     snprintf(g_lastError, sizeof g_lastError, "%s after %d nodes (start h%.1f, goal h%.1f)", found ? "ok" : "A* exhausted",
              closedCount, g->height[start], g->height[goal]);
+    if (!found && g_partialOk && nearNode >= 0 && nearNode != start) { goal = nearNode; found = 1; g_partialUsed = 1; }
     // Boxed in (the 2 m grid sees a tight spot as enclosed): plan from a nearby open node and walk to it first.
     static int rescuing;
     if (!found && closedCount < 64 && !rescuing && maxPts > 1 && !g_pathMask) {

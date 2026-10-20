@@ -201,6 +201,17 @@ static void do_map(const char *code, const char *who)
 {
     static char buf[65536];
     char *w[1024];
+    if (!_stricmp(code, "restart")) {   // !map restart: the current round over again (the user, 2026-10-16)
+        char say[200];
+        snprintf(say, sizeof say, "[BotMod] %s is restarting the round", who);
+        const char *s[3] = {"admin.say", say, "all"};
+        rcon_call(3, s, w, 1024, buf, sizeof buf);
+        Sleep(3000);
+        const char *rr[1] = {"mapList.restartRound"};
+        int rn = rcon_call(1, rr, w, 1024, buf, sizeof buf);
+        g_log("chat: %s restarted the round (%s)", who, rn > 0 ? w[0] : "no answer");
+        return;
+    }
     const char *list[1] = {"mapList.list"};
     int n = rcon_call(1, list, w, 1024, buf, sizeof buf);
     int idx = -1, count = 0, per = 3;

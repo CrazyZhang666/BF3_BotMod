@@ -96,6 +96,8 @@ int nav_rails_removed(void);
 int nav_stairs_added(void);
 // Long straight legs on the path mask (open water: a boat plots a direct line), instead of short road-hugging ones.
 void nav_set_long_legs(int on);
+void nav_set_partial(int on);   // routes that cannot reach the goal: to the nearest point they can (boats)
+int nav_partial_used(void);
 // Boats: water nodes connected all round (class 1 open water, 3 next to land - the beach).
 unsigned char *nav_boat_mask(const NavGrid *g, int *count);
 // The node of `mask` nearest (x, z) within maxDist (any height): 1 with its position.
