@@ -1,4 +1,4 @@
-﻿# BF3 BotMod installer / uninstaller - a small window (Install-BotMod.bat / Uninstall-BotMod.bat open it).
+﻿# Battl3Bots installer / uninstaller - a small window (Install-BotMod.bat / Uninstall-BotMod.bat open it).
 # Point it at bf3_server_Final.exe: that file's folder is the server folder (Battlefield_3_Server or whatever it is
 # called), BotMod's settings folder is "BotMod" next to it, and an uninstall.bat for that exact location is written
 # into the settings folder. -NoGui -ServerDir <folder> runs it from a console instead.
@@ -31,7 +31,7 @@ function Say([string]$m, [string]$c = 'Gray') {
     } else { Write-Host $m -ForegroundColor $c }
 }
 function Ask([string]$q) {
-    if ($script:Gui) { return ([System.Windows.Forms.MessageBox]::Show($q, 'BF3 BotMod', 'YesNo', 'Question') -eq 'Yes') }
+    if ($script:Gui) { return ([System.Windows.Forms.MessageBox]::Show($q, 'Battl3Bots', 'YesNo', 'Question') -eq 'Yes') }
     return ((Read-Host "$q [Y/N]") -match '^\s*y')
 }
 function Fail([string]$m) { throw $m }
@@ -137,7 +137,7 @@ function Copy-Set([string]$srcDir, [string]$dstDir, [string]$backupSub, [string[
 function Write-UninstallBat([string]$srv, [string]$botModDir) {
     $bat = @"
 @echo off
-:: BF3 BotMod uninstall - written by the installer for this server:
+:: Battl3Bots uninstall - written by the installer for this server:
 ::   $srv
 :: Puts the original xinput9_1_0.dll back and removes the BotMod core (shut the server down first).
 setlocal
@@ -238,7 +238,7 @@ function Invoke-Install([string]$srv) {
 
     Say ''
     if ($script:BackedUp) { Say "Replaced files were backed up to: $($script:BackupDir)" Cyan }
-    Say 'BotMod installed. Start the server from your launcher as usual - a "BF3 BotMod" console opens with it.' Green
+    Say 'Battl3Bots installed. Start the server from your launcher as usual - a "Battl3Bots" console opens with it.' Green
     Say "Add your in-game name to $botModDir\admins.txt to use the admin chat commands." Yellow
     return 'done'
 }
@@ -246,7 +246,7 @@ function Invoke-Install([string]$srv) {
 # ---------------------------------------------------------------------------------------------------------------
 if ($NoGui) {
     Say ''
-    Say "  BF3 BotMod (beta) - $Mode" White
+    Say "  Battl3Bots (beta) - $Mode" White
     try {
         $srv = Resolve-ServerDir $ServerDir
         if (-not $srv) { $srv = Find-ServerDir; if ($srv -and -not (Ask "Use the BF3 server in $srv ?")) { $srv = $null } }
@@ -261,7 +261,7 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text = 'BF3 BotMod (beta) - setup'
+$form.Text = 'Battl3Bots (beta) - setup'
 $form.Size = New-Object System.Drawing.Size(720, 520)
 $form.MinimumSize = New-Object System.Drawing.Size(560, 420)
 $form.StartPosition = 'CenterScreen'
@@ -324,7 +324,7 @@ $browse.Add_Click({
     $cur = Resolve-ServerDir $path.Text
     if ($cur) { $dlg.InitialDirectory = $cur }
     if ($dlg.ShowDialog($form) -eq 'OK') {
-        if ((Split-Path $dlg.FileName -Leaf) -ne $ExeName) { [void][System.Windows.Forms.MessageBox]::Show("That is not $ExeName.", 'BF3 BotMod', 'OK', 'Warning'); return }
+        if ((Split-Path $dlg.FileName -Leaf) -ne $ExeName) { [void][System.Windows.Forms.MessageBox]::Show("That is not $ExeName.", 'Battl3Bots', 'OK', 'Warning'); return }
         $path.Text = $dlg.FileName
     }
 })
@@ -350,6 +350,6 @@ $btnUninstall.Add_Click({ if (Ask 'Remove BotMod from this server (the original 
 $start = Resolve-ServerDir $ServerDir
 if (-not $start) { $start = Find-ServerDir }
 if ($start) { $path.Text = Join-Path $start $ExeName } else { Update-Status }
-Say "BF3 BotMod (beta). Pick your server's $ExeName above, then Install / update or Uninstall."
+Say "Battl3Bots (beta). Pick your server's $ExeName above, then Install / update or Uninstall."
 if ($Mode -eq 'uninstall') { $form.AcceptButton = $btnUninstall; $form.Add_Shown({ $btnUninstall.Focus() }) } else { $form.AcceptButton = $btnInstall }
 [void]$form.ShowDialog()

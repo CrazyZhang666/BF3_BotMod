@@ -307,7 +307,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         freopen("CONOUT$", "w", stdout);
         freopen("CONIN$", "r", stdin);
         char title[64];
-        snprintf(title, sizeof title, "BF3 BotMod - port %d", g_host.gamePort);
+        snprintf(title, sizeof title, "Battl3Bots - port %d", g_host.gamePort);
         SetConsoleTitleA(title);
         HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
         DWORD mode;

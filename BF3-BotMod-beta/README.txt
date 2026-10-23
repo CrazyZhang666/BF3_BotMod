@@ -1,4 +1,4 @@
-BF3 BotMod - beta 
+Battl3Bots - beta  (Battlefield 3 server bots; formerly "BF3 BotMod") 
 =================
 Mod originally for Automated LAN Party: http://alp.sandiegolan.net/
 Donate to keep the download alive: https://www.patreon.com/SanDiegoLAN/
@@ -17,7 +17,7 @@ INSTALL
      replaces is backed up into "BotMod_backup_<date>", and an uninstall.bat for that server is written
      into the BotMod folder.
   4. Start the server from your launcher as usual (ALP, bf4play GUI, BF-Portable, or a .bat) - BotMod loads with
-     it whichever way it is started, and a "BF3 BotMod" console window opens alongside.
+     it whichever way it is started, and a "Battl3Bots" console window opens alongside.
   Remove: BotMod\uninstall.bat (written at install), or Uninstall-BotMod.bat here (the same setup window) -
   either puts the original XInput DLL back and the server runs stock again.
   Update to a newer BotMod: just run the new Install-BotMod.bat - your settings files are kept.

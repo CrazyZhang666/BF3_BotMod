@@ -82,7 +82,15 @@ void nav_node_pos(const NavGrid *g, int node, float *out);   // world position o
 // Re-checks the grid's staircase links (rises of 0.9-1.6 m) with the strict rule - real stairs show intermediate heights,
 // a wall face does not - a few thousand rays per call. Returns 1 when the pass is complete (*removed = links dropped).
 int nav_fix_stairs_step(NavGrid *g, NavRayFn ray, int rayBudget, int *removed);
+// Water under something (a ship's hull and decks, a pier): a link from such a water node to its neighbour is cut if a ray just over the
+// water hits between them - a hull wall at the waterline, not open water under a bridge. Incremental: 1 when done (*cut: links cut).
+int nav_fix_hull_step(NavGrid *g, NavRayFn ray, int rayBudget, int *cut);
+int nav_force_link(NavGrid *g, const float *a, const float *b);   // a staircase link both ways between neighbouring cells (manual)
+int nav_hull_restored(void);   // links the last nav_fix_hull_step pass put back (clear now)
 void nav_set_path_mask(const unsigned char *mask);
+// n circles {x, y, z, r} whose nodes are off limits (the next plans, on foot or driving, until cleared) - other vehicles standing in the way,
+// routed round like any wall. No route round them: nav_find_path plans without them. NULL / 0 clears.
+void nav_set_blockers(const float *xyzr, int n);
 // Per node: distance to the nearest tree trunk in decimetres (255 = none within 2.5 m), or NULL. Soldiers' paths keep
 // off nodes within 1.2 m of one (dear, and no straight short cut past it).
 void nav_set_tree_dist(const NavGrid *g, const unsigned char *dist);
@@ -110,6 +118,11 @@ int nav_landings(const NavGrid *g, const unsigned char *mask, float sx, float sz
 // Caller frees with HeapFree. nav_landing_on() is nav_landings() restricted to beaches of landmass `label`, at least
 // minStart from (sx, sz).
 int *nav_land_labels(const NavGrid *g);
+// Connected regions of a mask (e.g. the drive mask: the land a vehicle can drive between), labels 1.. per node, 0 off the mask.
+// HeapFree the result.
+int *nav_mask_labels(const NavGrid *g, const unsigned char *mask);
+// The mask node nearest (x, z) within maxDist that is in the connected piece `label` (labels from nav_mask_labels)
+int nav_mask_nearest_in(const NavGrid *g, const unsigned char *mask, const int *labels, int label, float x, float z, float maxDist, float *out);
 // Open water (boat mask class 1) nearest (x, z) within maxDist: 1 with its position.
 int nav_open_water_near(const NavGrid *g, const unsigned char *mask, float x, float z, float maxDist, float *out);
 // Land (any cell with no node of the boat mask: shore, rocks, piers) within radius of (x, z): its mean position in

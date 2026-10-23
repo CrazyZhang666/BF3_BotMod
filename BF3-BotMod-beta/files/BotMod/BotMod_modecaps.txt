@@ -1,0 +1,3 @@
+# Player cap per game mode, above (or below) the game's own size - "<mode> <players>", mode without its digit
+# (RushLarge0 -> RushLarge). Modes not listed use the game's size (Conquest Large 64, Rush 32, Air Superiority 24 ...).
+RushLarge 64

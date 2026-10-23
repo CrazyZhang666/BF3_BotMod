@@ -204,6 +204,8 @@ static void do_map(const char *code, const char *who)
     if (!_stricmp(code, "restart")) {   // !map restart: the current round over again (the user, 2026-10-16)
         char say[200];
         snprintf(say, sizeof say, "[BotMod] %s is restarting the round", who);
+        InterlockedIncrement(&g_roundsOver);   // (bots hold their spawns now: the round is torn down - spawning into it, then again into the
+                                               //  reload with the old one's objects, crashed server 3 on a double restart, 2026-10-22)
         const char *s[3] = {"admin.say", say, "all"};
         rcon_call(3, s, w, 1024, buf, sizeof buf);
         Sleep(3000);

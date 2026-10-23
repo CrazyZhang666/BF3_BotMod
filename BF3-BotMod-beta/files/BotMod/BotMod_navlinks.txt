@@ -1,0 +1,4 @@
+# Nav links forced both ways (a staircase the automatic checks miss): <level> x y z  x y z  - neighbouring 2 m cells, straight.
+# Kharg Island (MP_018): the stairway up to the M-COM landing at (-442, 181) - foot of the flight, mid-flight, landing
+MP_018 -439.2 92.92 184.7  -437.2 94.32 184.7
+MP_018 -437.2 94.32 184.7  -437.2 96.32 182.7

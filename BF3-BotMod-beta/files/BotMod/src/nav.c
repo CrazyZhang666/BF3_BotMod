@@ -14,8 +14,9 @@
 #define MIN_HEADROOM     1.8f     // standing room needed under the surface above
 #define MAX_STEP_UP      0.9f     // vertical step a soldier can walk up between adjacent cells
 #define MAX_DROP         4.0f     // ledge a soldier may walk off (one-way link down), e.g. hangar deck -> sea
-#define MAX_STAIR_UP     1.6f     // neighbours this far apart connect if the ground between them is a staircase
-#define MAX_STAIR_STEP   0.6f     // largest single rise between the 0.5 m samples of a staircase
+#define MAX_STAIR_UP     2.6f     // neighbours this far apart connect if the ground between them is a staircase (1.6: Kharg's 2.4 m flight
+                                  //  up to an M-COM landing linked one way only - nobody routed up to it, 2026-10-23)
+#define MAX_STAIR_STEP   0.7f     // largest single rise between the 0.5 m samples of a staircase
 #define KNEE_HEIGHT      0.6f     // clearance rays between cells
 #define CHEST_HEIGHT     1.4f
 #define NAV_FILE_MAGIC   0x3556414e  // "NAV5" (NAV4 + water flags, fence crossings, top 2 + bottom 4 surfaces)
@@ -34,6 +35,36 @@ static int g_partialOk, g_partialUsed;
 void nav_set_partial(int on) { g_partialOk = on; g_partialUsed = 0; }
 int nav_partial_used(void) { return g_partialUsed; }
 void nav_set_path_mask(const unsigned char *mask) { g_pathMask = mask; }
+#define NAV_MAX_BLOCKERS 32
+static float g_blk[NAV_MAX_BLOCKERS][4];
+static int g_blkN, g_blkOff;
+static float g_blkBox[4];   // (all of them: x0, z0, x1, z1 - most nodes are nowhere near one: no per-blocker test for them)
+void nav_set_blockers(const float *xyzr, int n)
+{
+    if (n > NAV_MAX_BLOCKERS) n = NAV_MAX_BLOCKERS;
+    g_blkN = xyzr && n > 0 ? n : 0;
+    if (g_blkN) memcpy(g_blk, xyzr, (size_t)g_blkN * sizeof g_blk[0]);
+    g_blkBox[0] = g_blkBox[1] = 1e30f; g_blkBox[2] = g_blkBox[3] = -1e30f;
+    for (int k = 0; k < g_blkN; k++) {
+        float r = g_blk[k][3];
+        if (g_blk[k][0] - r < g_blkBox[0]) g_blkBox[0] = g_blk[k][0] - r;
+        if (g_blk[k][2] - r < g_blkBox[1]) g_blkBox[1] = g_blk[k][2] - r;
+        if (g_blk[k][0] + r > g_blkBox[2]) g_blkBox[2] = g_blk[k][0] + r;
+        if (g_blk[k][2] + r > g_blkBox[3]) g_blkBox[3] = g_blk[k][2] + r;
+    }
+}
+static int node_blocked(const NavGrid *g, int node)   // a vehicle stands on it (routes on foot / swimming and vehicle routes)
+{
+    if (!g_blkN || g_blkOff) return 0;
+    int cl = node / NAV_LAYERS;
+    float x = g->x0 + (cl % g->w) * g->cell, z = g->z0 + (cl / g->w) * g->cell, y = g->height[node];
+    if (x < g_blkBox[0] || x > g_blkBox[2] || z < g_blkBox[1] || z > g_blkBox[3]) return 0;
+    for (int k = 0; k < g_blkN; k++) {
+        float dx = x - g_blk[k][0], dz = z - g_blk[k][2];
+        if (dx * dx + dz * dz < g_blk[k][3] * g_blk[k][3] && fabsf(y - g_blk[k][1]) < 4.0f) return 1;
+    }
+    return 0;
+}
 static float g_vehHalf = 1.5f;   // vehicles: half the width kept clear on a straight short cut
 static float g_hMul = 1.0f;      // the taxi map's dear off-street classes made A* search 60000 nodes on Karkand: greedier there
 void nav_set_vehicle_half(float h) { g_vehHalf = h > 0 ? h : 1.5f; g_hMul = h > 0 ? 2.0f : 1.0f; }
@@ -448,7 +479,9 @@ static int step_node(const NavGrid *g, int node, int d)
     if (!(g->edges[node] & (1 << d))) return -1;
     int c = node / L, l = node % L;
     int nc = (c / g->w + kDir[d][1]) * g->w + c % g->w + kDir[d][0];
-    int nl = neighbour_layer(g, c, l, nc, d & 1);
+    int stairOk = g_stairOk && g_stairOkGrid == g && g_stairOkW == g->w && g_stairOkH == g->h && (g_stairOk[node] & (1 << d));
+    int nl = stairOk ? stair_layer(g, c, l, nc) : -1;   // a link known to be a staircase up: the step up, not the floor under it (Kharg,
+    if (nl < 0) nl = neighbour_layer(g, c, l, nc, d & 1);   //  2026-10-23: a flight over walkable ground led to that ground - never up)
     // A cell can hold both a surface ~1 m up and one below: the next step of a staircase plus the floor under it (Seine),
     // or an escalator's handrail top plus its steps going down (Metro). The load-time stair re-check records which links
     // are real staircases: those go up, everything else is the drop. (Up first sent bots onto Metro's handrails - they
@@ -506,6 +539,7 @@ static int straight_walkable(const NavGrid *g, int a, int b)
         for (d = 0; d < 8; d++) if (kDir[d][0] == mx && kDir[d][1] == mz) break;
         node = step_node(g, node, d);
         if (node < 0 || (g_pathMask && !g_pathMask[node])) return 0;
+        if (node_blocked(g, node)) return 0;   // (no short cut through a parked vehicle)
         if (g_pathMask && g_pathMask[node] == 5 && node != b) return 0;   // no short cut past a tree trunk
         if (!g_pathMask && TREE_DIST(g) && TREE_DIST(g)[node] <= TREE_NEAR_DM && node != b) return 0;
         x += mx;
@@ -991,6 +1025,64 @@ static int rail_top(const NavGrid *g, NavRayFn ray, int node, int *used)
     }
     return falls >= 2;
 }
+static const NavGrid *g_hullGrid;
+static int g_hullCursor, g_hullCut, g_hullRestored;
+int nav_hull_restored(void) { return g_hullRestored; }
+int nav_fix_hull_step(NavGrid *g, NavRayFn ray, int rayBudget, int *cut)
+{
+    int n = g->w * g->h * L, used = 0;
+    if (g_hullGrid != g) { g_hullGrid = g; g_hullCursor = 0; g_hullCut = 0; g_hullRestored = 0; }
+    for (; g_hullCursor < n && used < rayBudget; g_hullCursor++) {
+        int node = g_hullCursor, c = node / L;
+        if (!(g->flags[node] & NAV_WATER) || !(g->flags[node] & NAV_WALKABLE)) continue;
+        float h = g->height[node];
+        int over = 0;   // (something above it in the same column: under a ship / pier / bridge)
+        for (int l2 = 0; l2 < L && !over; l2++) {
+            int o = c * L + l2;
+            if (o != node && (g->flags[o] & NAV_WALKABLE) && g->height[o] > h + 2.0f) over = 1;
+        }
+        if (!over) continue;
+        int l = node % L;
+        for (int d = 0; d < 8; d++) {   // every water neighbour, linked or not: re-checked - cut through solid, linked again when clear (a cut made
+            int nx2 = c % g->w + kDir[d][0], nz2 = c / g->w + kDir[d][1];   //  through a parked boat - Kharg's well, 2026-10-23 - comes back)
+            if (nx2 < 0 || nz2 < 0 || nx2 >= g->w || nz2 >= g->h) continue;
+            int nc = nz2 * g->w + nx2, nl = neighbour_layer(g, c, l, nc, d & 1);
+            if (nl < 0) continue;
+            int nb = nc * L + nl;
+            if (!(g->flags[nb] & NAV_WATER) || !(g->flags[nb] & NAV_WALKABLE) || fabsf(g->height[nb] - h) > 1.0f) continue;
+            float a[3], b[3];
+            node_pos(g, node, a); node_pos(g, nb, b);
+            a[1] = h + 0.5f; b[1] = g->height[nb] + 0.5f;
+            used++;
+            int back = (d + 4) & 7, linked = (g->edges[node] >> d) & 1;
+            if (ray(a, b, NULL, NULL)) {
+                if (linked) { g->edges[node] &= (unsigned char)~(1 << d); g->edges[nb] &= (unsigned char)~(1 << back); g_hullCut++; }
+            } else if (!linked) { g->edges[node] |= (unsigned char)(1 << d); g->edges[nb] |= (unsigned char)(1 << back); g_hullRestored++; }
+        }
+    }
+    if (cut) *cut = g_hullCut;
+    return g_hullCursor >= n;
+}
+
+// A link forced both ways between the nodes nearest a and b (neighbouring cells, straight): a staircase the checks miss (BotMod_navlinks.txt).
+// 1 done, 0 not neighbours / no nodes.
+int nav_force_link(NavGrid *g, const float *a, const float *b)
+{
+    int na = nearest_node(g, a[0], a[1], a[2]), nb = nearest_node(g, b[0], b[1], b[2]);
+    if (na < 0 || nb < 0) return 0;
+    int ca = na / L, cb = nb / L, dx = cb % g->w - ca % g->w, dz = cb / g->w - ca / g->w, d = -1;
+    for (int k = 0; k < 8; k += 2) if (kDir[k][0] == dx && kDir[k][1] == dz) d = k;
+    if (d < 0) return 0;
+    int back = (d + 4) & 7;
+    g->edges[na] |= (unsigned char)(1 << d);
+    g->edges[nb] |= (unsigned char)(1 << back);
+    if (g_stairOk && g_stairOkGrid == g) {   // (the higher one is reached as a staircase up from the lower)
+        if (g->height[nb] > g->height[na]) g_stairOk[na] |= (unsigned char)(1 << d);
+        else g_stairOk[nb] |= (unsigned char)(1 << back);
+    }
+    return 1;
+}
+
 int nav_fix_stairs_step(NavGrid *g, NavRayFn ray, int rayBudget, int *removed)
 {
     int n = g->w * g->h * L, used = 0;
@@ -1118,6 +1210,31 @@ unsigned char *nav_boat_mask(const NavGrid *g, int *count)
     return m;
 }
 
+int nav_mask_nearest_in(const NavGrid *g, const unsigned char *mask, const int *labels, int label, float x, float z, float maxDist, float *out)
+{
+    int c = nav_cell_index(g, x, z);
+    if (c < 0 || !labels || !label) return 0;
+    int cx = c % g->w, cz = c / g->w, rmax = (int)(maxDist / g->cell);
+    for (int r = 0; r <= rmax; r++) {
+        int best = -1;
+        float bestD = 1e30f;
+        for (int dz = -r; dz <= r; dz++)
+            for (int dx = -r; dx <= r; dx++) {
+                if (abs(dx) != r && abs(dz) != r) continue;
+                int x2 = cx + dx, z2 = cz + dz;
+                if (x2 < 0 || z2 < 0 || x2 >= g->w || z2 >= g->h) continue;
+                for (int l = 0; l < L; l++) {
+                    int node = (z2 * g->w + x2) * L + l;
+                    if (!mask[node] || labels[node] != label) continue;
+                    float d = (float)(dx * dx + dz * dz);
+                    if (d < bestD) { bestD = d; best = node; }
+                }
+            }
+        if (best >= 0) { node_pos(g, best, out); return 1; }
+    }
+    return 0;
+}
+
 int nav_mask_nearest(const NavGrid *g, const unsigned char *mask, float x, float z, float maxDist, float *out)
 {
     int c = nav_cell_index(g, x, z);
@@ -1242,6 +1359,30 @@ int *nav_land_labels(const NavGrid *g)
             for (int d = 0; d < 8; d++) {
                 int v = step_node(g, u, d);
                 if (v < 0 || lab[v] || (g->flags[v] & NAV_WATER)) continue;
+                lab[v] = next;
+                queue[tail++] = v;
+            }
+        }
+    }
+    nav_release(queue);
+    return lab;
+}
+
+int *nav_mask_labels(const NavGrid *g, const unsigned char *mask)
+{
+    int n = g->w * g->h * L, next = 0;
+    int *lab = nav_alloc((size_t)n * sizeof(int)), *queue = nav_alloc((size_t)n * sizeof(int));
+    if (!lab || !queue || !mask) { nav_release(lab); nav_release(queue); return NULL; }
+    for (int s = 0; s < n; s++) {
+        if (lab[s] || !mask[s]) continue;
+        int head = 0, tail = 0;
+        lab[s] = ++next;
+        queue[tail++] = s;
+        while (head < tail) {
+            int u = queue[head++];
+            for (int d = 0; d < 8; d++) {
+                int v = step_node(g, u, d);
+                if (v < 0 || lab[v] || !mask[v]) continue;
                 lab[v] = next;
                 queue[tail++] = v;
             }
@@ -1403,7 +1544,19 @@ int nav_reach(const NavGrid *g, float x, float y, float z, float *nodePos)
     return count;
 }
 
+static int nav_find_path_once(const NavGrid *g, NavRayFn ray, float sx, float sy, float sz, float tx, float ty, float tz, float *out, int maxPts);
 int nav_find_path(const NavGrid *g, NavRayFn ray, float sx, float sy, float sz, float tx, float ty, float tz, float *out, int maxPts)
+{
+    int n = nav_find_path_once(g, ray, sx, sy, sz, tx, ty, tz, out, maxPts);
+    if (!n && g_blkN && !strstr(g_lastError, "exhausted")) {   // boxed in by vehicles: the route as if they were not there (not after a search
+        // that used its whole budget - that one is too far / unreachable either way, and running it twice made 500 ms plans, 2026-10-23)
+        g_blkOff = 1;
+        n = nav_find_path_once(g, ray, sx, sy, sz, tx, ty, tz, out, maxPts);
+        g_blkOff = 0;
+    }
+    return n;
+}
+static int nav_find_path_once(const NavGrid *g, NavRayFn ray, float sx, float sy, float sz, float tx, float ty, float tz, float *out, int maxPts)
 {
     int start = nearest_node(g, sx, sy, sz), goal = nearest_node(g, tx, ty, tz);
     if (goal < 0 && !isnan(ty)) goal = nearest_node(g, tx, NAN, tz);
@@ -1444,7 +1597,8 @@ int nav_find_path(const NavGrid *g, NavRayFn ray, float sx, float sy, float sz, 
     // vehicles: the full weight too (0.5 kept it exact for the cheap paved roads - and searched half of a big map: a
     // Damavand re-route froze the server 1.5 s); a road-hugging route a little less than perfect plans in a fraction
     float hw = ASTAR_HEURISTIC_WEIGHT * (g_pathMask ? g_hMul : g_roadMask ? 0.6f : 1.0f);
-    int maxExpanded = 60000;   // (an unreachable goal used to search a whole big map - ~100 ms - and bots retried every second)
+    int maxExpanded = g_longLegs ? 120000 : 60000;   // (an unreachable goal used to search a whole big map - ~100 ms - and bots retried every
+                                                     //  second; water legs: open sea round an island is wide - Kharg's ship to its north shore, 2026-10-22)
     gs[start] = 0; from[start] = -1; stamp[start] = curStamp;
     heap_push(heap, &hn, 0, start);
     int nearNode = -1;   // (partial routes: the closed node nearest the goal)
@@ -1462,7 +1616,7 @@ int nav_find_path(const NavGrid *g, NavRayFn ray, float sx, float sy, float sz, 
         if (++closedCount > maxExpanded) break;   // unreachable goals would otherwise search the whole grid
         for (int d = 0; d < 8; d++) {
             int nb = step_node(g, cur, d);
-            if (nb < 0 || (g_pathMask && !g_pathMask[nb])) continue;
+            if (nb < 0 || (g_pathMask && !g_pathMask[nb]) || node_blocked(g, nb)) continue;
             // no slicing through a solid corner: a diagonal needs at least one adjacent straight move (requiring both
             // cut MP_Subway in two - its halves join only through diagonal steps)
             if ((d & 1) && step_node(g, cur, (d + 7) & 7) < 0 && step_node(g, cur, (d + 1) & 7) < 0) continue;
