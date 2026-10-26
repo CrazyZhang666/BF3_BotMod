@@ -52,6 +52,17 @@ int nav_reach(const NavGrid *g, float x, float y, float z, float *nodePos);
 // whose layers used up the cell's surfaces), adds the ground it finds and re-links the area. Returns nodes added.
 int nav_reprobe_area(NavGrid *g, NavRayFn ray, float x0, float z0, float x1, float z1, float fromY);   // why the last nav_find_path failed
 int nav_find_path(const NavGrid *g, NavRayFn ray, float sx, float sy, float sz, float tx, float ty, float tz, float *out, int maxPts);
+// Route worker (2026-10-25): the A* alone, off the game thread, and the string pulling of its node chain on the game thread.
+int nav_find_nodes(const NavGrid *g, float sx, float sy, float sz, float tx, float ty, float tz, int *nodes, int maxNodes);
+int nav_smooth_path(const NavGrid *g, NavRayFn ray, float sx, float sy, float sz, const int *nodes, int len, float *out, int maxPts);
+void nav_set_worker_thread(unsigned tid);   // that thread searches with its own mask / blockers / buffers
+void nav_set_free_hook(void (*f)(const NavGrid *));   // called before a grid is freed
+const unsigned char *nav_path_mask(void);
+int nav_long_legs(void);
+void nav_vehicle_state(float *half, float *hmul);
+void nav_set_vehicle_state(float half, float hmul);
+int nav_get_blockers(float *xyzr, int max);
+void nav_set_last_error(const char *s);
 // Removes the links out of the node at (x, y, z) that head towards (tx, tz) (+-60 deg); used when a bot gets stuck.
 int nav_block_towards(NavGrid *g, float x, float y, float z, float tx, float tz);
 // Puts back links blocked by nav_block_towards once their 3 minutes are up (all = every one). Returns how many.
@@ -106,6 +117,8 @@ int nav_stairs_added(void);
 void nav_set_long_legs(int on);
 void nav_set_partial(int on);   // routes that cannot reach the goal: to the nearest point they can (boats)
 int nav_partial_used(void);
+int nav_partial_ok(void);
+void nav_set_partial_used(int used);   // (the route worker hands it back)
 // Boats: water nodes connected all round (class 1 open water, 3 next to land - the beach).
 unsigned char *nav_boat_mask(const NavGrid *g, int *count);
 // The node of `mask` nearest (x, z) within maxDist (any height): 1 with its position.

@@ -26,19 +26,65 @@
 #define L                NAV_LAYERS
 
 static const int kDir[8][2] = {{1, 0}, {1, 1}, {0, 1}, {-1, 1}, {-1, 0}, {-1, -1}, {0, -1}, {1, -1}};
-static const unsigned char *g_pathMask;   // vehicles: only these nodes (NULL = soldiers)
-static int g_longLegs;                    // boats: straight lines across open water
+// ---- Search state, one set per thread (2026-10-25: vehicle route searches run on a worker thread - 140-476 ms each on the game thread
+// with 50 bots, a hitch every 20 s): the game thread's and the route worker's. Everything a search reads or writes besides the grid
+// itself lives here; the setters below set the calling thread's own.
+#define NAV_MAX_BLOCKERS 32
+#define NAV_MAX_OUT 256
+typedef struct NavCtx {
+    const unsigned char *pathMask;   // vehicles: only these nodes (NULL = soldiers)
+    int longLegs;                    // boats: straight lines across open water
+    int partialOk, partialUsed;
+    float blk[NAV_MAX_BLOCKERS][4];
+    int blkN, blkOff;
+    float blkBox[4];
+    float vehHalf, hMul;
+    char lastError[128];
+    short outLink[NAV_MAX_OUT];
+    int rescuing;
+    int bufN, heapCap;               // A* buffers (per grid size)
+    float *gs;
+    int *from;
+    unsigned *stamp, curStamp;
+    void *heap;
+    int *nodesOut, nodesMax;         // set: the search hands back its raw node chain (no string pulling)
+} NavCtx;
+static NavCtx g_navCtx[2] = {{.vehHalf = 1.5f, .hMul = 1.0f}, {.vehHalf = 1.5f, .hMul = 1.0f}};
+static volatile unsigned g_navWorkerTid;
+void nav_set_worker_thread(unsigned tid) { g_navWorkerTid = tid; }
+static inline NavCtx *nav_ctx(void)
+{
+    unsigned tid;
+    __asm__("movl %%fs:0x24, %0" : "=r"(tid));   // (the TEB's thread id - no call)
+    return tid == g_navWorkerTid ? &g_navCtx[1] : &g_navCtx[0];
+}
+#define g_pathMask    (nav_ctx()->pathMask)
+#define g_longLegs    (nav_ctx()->longLegs)
+#define g_partialOk   (nav_ctx()->partialOk)
+#define g_partialUsed (nav_ctx()->partialUsed)
+#define g_blk         (nav_ctx()->blk)
+#define g_blkN        (nav_ctx()->blkN)
+#define g_blkOff      (nav_ctx()->blkOff)
+#define g_blkBox      (nav_ctx()->blkBox)
+#define g_vehHalf     (nav_ctx()->vehHalf)
+#define g_hMul        (nav_ctx()->hMul)
+#define g_lastError   (nav_ctx()->lastError)
+#define g_outLink     (nav_ctx()->outLink)
 void nav_set_long_legs(int on) { g_longLegs = on; }
+const unsigned char *nav_path_mask(void) { return g_pathMask; }
+int nav_long_legs(void) { return g_longLegs; }
+void nav_vehicle_state(float *half, float *hmul) { *half = g_vehHalf; *hmul = g_hMul; }
+void nav_set_vehicle_state(float half, float hmul) { g_vehHalf = half; g_hMul = hmul; }
+int nav_get_blockers(float *xyzr, int max) { int n = g_blkN < max ? g_blkN : max; if (n > 0) memcpy(xyzr, g_blk, (size_t)n * sizeof g_blk[0]); return n; }
+void nav_set_last_error(const char *s) { snprintf(g_lastError, sizeof g_lastError, "%s", s); }
 // Partial routes (boats, 2026-10-19: Noshahr's flag 0 sits behind a quay wall the water map counted as shallows - every boat
 // route to it searched the whole sea and failed): when the goal cannot be reached, the route to the explored node nearest it.
-static int g_partialOk, g_partialUsed;
 void nav_set_partial(int on) { g_partialOk = on; g_partialUsed = 0; }
 int nav_partial_used(void) { return g_partialUsed; }
+int nav_partial_ok(void) { return g_partialOk; }
+void nav_set_partial_used(int used) { g_partialUsed = used; }
 void nav_set_path_mask(const unsigned char *mask) { g_pathMask = mask; }
-#define NAV_MAX_BLOCKERS 32
-static float g_blk[NAV_MAX_BLOCKERS][4];
-static int g_blkN, g_blkOff;
-static float g_blkBox[4];   // (all of them: x0, z0, x1, z1 - most nodes are nowhere near one: no per-blocker test for them)
+// (g_blkBox: all of them, x0, z0, x1, z1 - most nodes are nowhere near one: no per-blocker test for them)
 void nav_set_blockers(const float *xyzr, int n)
 {
     if (n > NAV_MAX_BLOCKERS) n = NAV_MAX_BLOCKERS;
@@ -65,8 +111,8 @@ static int node_blocked(const NavGrid *g, int node)   // a vehicle stands on it 
     }
     return 0;
 }
-static float g_vehHalf = 1.5f;   // vehicles: half the width kept clear on a straight short cut
-static float g_hMul = 1.0f;      // the taxi map's dear off-street classes made A* search 60000 nodes on Karkand: greedier there
+// g_vehHalf - vehicles: half the width kept clear on a straight short cut; g_hMul - the taxi map's dear off-street classes made A*
+// search 60000 nodes on Karkand: greedier there
 void nav_set_vehicle_half(float h) { g_vehHalf = h > 0 ? h : 1.5f; g_hMul = h > 0 ? 2.0f : 1.0f; }
 static const unsigned char *g_treeDistSet;
 static const NavGrid *g_treeGrid;   // the grid the table belongs to (a table from another map is never read)
@@ -117,8 +163,11 @@ static void nav_blocks_forget(const NavGrid *g);
 static unsigned char *g_stairOk;          // bit d: the link in straight direction d is a real staircase up (re-checked)
 static const NavGrid *g_stairOkGrid;
 static int g_stairOkW, g_stairOkH;
+static void (*g_beforeFree)(const NavGrid *);
+void nav_set_free_hook(void (*f)(const NavGrid *)) { g_beforeFree = f; }
 void nav_free(NavGrid *g)
 {
+    if (g && g_beforeFree) g_beforeFree(g);   // (the route worker may be searching it)
     if (!g) return;
     if (g_stairOkGrid == g) { nav_release(g_stairOk); g_stairOk = NULL; g_stairOkGrid = NULL; }
     nav_blocks_forget(g);   // its stuck-spot blocks die with it (a new map's grid can land at the same address)
@@ -698,15 +747,11 @@ int nav_repair_around(NavGrid *g, NavRayFn ray, float x, float y, float z, float
     return removed;
 }
 
-static char g_lastError[128];
-
 // ---- special links (ladders) ----
 #define NAV_MAX_LINKS 256
 typedef struct NavLink { const NavGrid *g; int from, to; float cost; float a[3], b[3]; } NavLink;
 static NavLink g_links[NAV_MAX_LINKS];
 static int g_linkCount;
-#define NAV_MAX_OUT 256
-static short g_outLink[NAV_MAX_OUT];
 void nav_clear_links(void) { g_linkCount = 0; }
 static int nearest_node(const NavGrid *g, float x, float y, float z);
 int nav_add_link(const NavGrid *g, const float *a, const float *b, float cost)
@@ -1544,6 +1589,62 @@ int nav_reach(const NavGrid *g, float x, float y, float z, float *nodePos)
     return count;
 }
 
+// String pulling over a node chain (from the bot's actual position: the farthest node reachable in a straight line each time).
+// The game thread only - its rays are the engine's.
+int nav_smooth_path(const NavGrid *g, NavRayFn ray, float sx, float sy, float sz, const int *nodes, int len, float *out, int maxPts)
+{
+    int count = 0;
+    if (len <= 0) return 0;
+    {
+        // String pulling from the bot's actual position: take the farthest node reachable in a straight line.
+        float from[3] = {sx, isnan(sy) ? g->height[nodes[0]] : sy, sz};
+        int anchor = -1;
+        while (anchor < len - 1 && count < maxPts) {
+            int next = anchor + 1, limit = len - 1, link = -1;
+            if (anchor >= 0) link = link_between(g, nodes[anchor], nodes[anchor + 1]);
+            if (link < 0)   // the next link start is as far as a straight run may go
+                for (int j = anchor + 1; j < len - 1; j++) if (link_between(g, nodes[j], nodes[j + 1]) >= 0) { limit = j; break; }
+            if (link < 0)
+                for (int j = limit; j > next; j--) {
+                    if (j - anchor > (g_pathMask && !g_longLegs ? 8 : g_longLegs ? 250 : 64)) continue;   // cars: short legs on the road; boats: as long as the water allows
+                    if (anchor >= 0 && !straight_walkable(g, nodes[anchor], nodes[j])) continue;
+                    float to[3];
+                    node_pos(g, nodes[j], to);
+                    if (ray && !nav_segment_clear(ray, from, to)) continue;
+                    next = j;
+                    break;
+                }
+            if (link < 0 && next == anchor + 1 && anchor >= 0 && count < maxPts - 1) {   // through a doorway: via its gap
+                int a = nodes[anchor], b = nodes[next], ca = a / L, cb = b / L;
+                int ddx = cb % g->w - ca % g->w, ddz = cb / g->w - ca / g->w, dd = -1;
+                for (int k = 0; k < 8; k += 2) if (kDir[k][0] == ddx && kDir[k][1] == ddz) dd = k;
+                if (dd >= 0 && (g->fences[a] & (1 << (dd + 1)))) {
+                    float pa[3], pb[3], off = 0;
+                    node_pos(g, a, pa); node_pos(g, b, pb);
+                    for (int k = 0; k < 4 && ray; k++)
+                        if (pair_clear(ray, pa[0], pa[1], pa[2], pb[0], pb[1], pb[2], kDoorOffsets[k])) { off = kDoorOffsets[k]; break; }
+                    float dx = pb[0] - pa[0], dz = pb[2] - pa[2], ln = sqrtf(dx * dx + dz * dz);
+                    float *o = &out[count * 3];
+                    o[0] = (pa[0] + pb[0]) * 0.5f - dz / ln * off;
+                    o[1] = pa[1] > pb[1] ? pa[1] : pb[1];
+                    o[2] = (pa[2] + pb[2]) * 0.5f + dx / ln * off;
+                    if (count < NAV_MAX_OUT) g_outLink[count] = -1;
+                    memcpy(from, o, sizeof from);
+                    count++;
+                }
+            }
+            int startsLink = next < len - 1 && link_between(g, nodes[next], nodes[next + 1]) >= 0;
+            if (link >= 0) memcpy(&out[count * 3], g_links[link].b, 12);   // over the ladder: its exit spot
+            else if (startsLink) memcpy(&out[count * 3], g_links[link_between(g, nodes[next], nodes[next + 1])].a, 12);   // its foot
+            else node_pos(g, nodes[next], &out[count * 3]);
+            if (count < NAV_MAX_OUT) g_outLink[count] = (short)link;
+            memcpy(from, &out[count * 3], sizeof from);
+            count++;
+            anchor = next;
+        }
+    }
+    return count;
+}
 static int nav_find_path_once(const NavGrid *g, NavRayFn ray, float sx, float sy, float sz, float tx, float ty, float tz, float *out, int maxPts);
 int nav_find_path(const NavGrid *g, NavRayFn ray, float sx, float sy, float sz, float tx, float ty, float tz, float *out, int maxPts)
 {
@@ -1554,6 +1655,17 @@ int nav_find_path(const NavGrid *g, NavRayFn ray, float sx, float sy, float sz, 
         n = nav_find_path_once(g, ray, sx, sy, sz, tx, ty, tz, out, maxPts);
         g_blkOff = 0;
     }
+    return n;
+}
+// The A* alone (the route worker): the node chain from start to goal into nodes[], its length (0: none - nav_last_error says why).
+// No rays: safe off the game thread, given a grid nobody frees meanwhile and this thread's own mask / blockers.
+int nav_find_nodes(const NavGrid *g, float sx, float sy, float sz, float tx, float ty, float tz, int *nodes, int maxNodes)
+{
+    NavCtx *X = nav_ctx();
+    float dummy[3];
+    X->nodesOut = nodes; X->nodesMax = maxNodes;
+    int n = nav_find_path(g, NULL, sx, sy, sz, tx, ty, tz, dummy, 1);
+    X->nodesOut = NULL;
     return n;
 }
 static int nav_find_path_once(const NavGrid *g, NavRayFn ray, float sx, float sy, float sz, float tx, float ty, float tz, float *out, int maxPts)
@@ -1570,24 +1682,24 @@ static int nav_find_path_once(const NavGrid *g, NavRayFn ray, float sx, float sy
     #define ASTAR_HEURISTIC_WEIGHT 1.5f
     #define ASTAR_MAX_EXPANDED     150000
     int n = g->w * g->h * L;
-    static int bufN;
-    static float *gs;
-    static int *from;
-    static unsigned *stamp;
-    static unsigned curStamp;
-    static HeapItem *heap;
-    static int heapCap;
-    if (bufN != n) {
-        nav_release(gs); nav_release(from); nav_release(stamp); nav_release(heap);
-        gs = nav_alloc(n * sizeof(float));
-        from = nav_alloc(n * sizeof(int));
-        stamp = nav_alloc(n * sizeof(unsigned));
-        heapCap = n + 1024;
-        heap = nav_alloc(heapCap * sizeof(HeapItem));
-        bufN = n;
-        curStamp = 0;
+    NavCtx *X = nav_ctx();   // (this thread's own buffers)
+    if (X->bufN != n) {
+        nav_release(X->gs); nav_release(X->from); nav_release(X->stamp); nav_release(X->heap);
+        X->gs = nav_alloc(n * sizeof(float));
+        X->from = nav_alloc(n * sizeof(int));
+        X->stamp = nav_alloc(n * sizeof(unsigned));
+        X->heapCap = n + 1024;
+        X->heap = nav_alloc(X->heapCap * sizeof(HeapItem));
+        X->bufN = n;
+        X->curStamp = 0;
     }
-    curStamp += 2;   // stamp = curStamp: open (gs/from valid); curStamp + 1: closed
+    float *gs = X->gs;
+    int *from = X->from, heapCap = X->heapCap;
+    unsigned *stamp = X->stamp;
+    HeapItem *heap = X->heap;
+    const unsigned char *pathMask = X->pathMask;   // (the hot loop reads its own copy)
+    X->curStamp += 2;   // stamp = curStamp: open (gs/from valid); curStamp + 1: closed
+    unsigned curStamp = X->curStamp;
     int hn = 0, found = 0, count = 0, closedCount = 0;
     #define SEEN(x)   (stamp[x] >= curStamp)
     #define CLOSED(x) (stamp[x] == curStamp + 1)
@@ -1616,17 +1728,17 @@ static int nav_find_path_once(const NavGrid *g, NavRayFn ray, float sx, float sy
         if (++closedCount > maxExpanded) break;   // unreachable goals would otherwise search the whole grid
         for (int d = 0; d < 8; d++) {
             int nb = step_node(g, cur, d);
-            if (nb < 0 || (g_pathMask && !g_pathMask[nb]) || node_blocked(g, nb)) continue;
+            if (nb < 0 || (pathMask && !pathMask[nb]) || node_blocked(g, nb)) continue;
             // no slicing through a solid corner: a diagonal needs at least one adjacent straight move (requiring both
             // cut MP_Subway in two - its halves join only through diagonal steps)
             if ((d & 1) && step_node(g, cur, (d + 7) & 7) < 0 && step_node(g, cur, (d + 1) & 7) < 0) continue;
             float climb = g->height[nb] - g->height[cur];
             float step = ((d & 1) ? 1.4142f : 1.0f) * g->cell;
             static const float kDriveCost[8] = {1.0f, 0.5f, 1.0f, 1.6f, 2.5f, 12.0f, 4.0f, 1.0f};   // 5: within 2.5 m of a tree; 6: taxi map, off-street at an edge
-            float mul = g_pathMask ? kDriveCost[g_pathMask[nb] & 7] : (g->flags[nb] & NAV_WATER) ? WATER_COST_MUL :
+            float mul = pathMask ? kDriveCost[pathMask[nb] & 7] : (g->flags[nb] & NAV_WATER) ? WATER_COST_MUL :
                         g_roadMask && g_roadMask[nb] == 1 ? 0.6f : g_roadMask && g_roadMask[nb] == 2 ? 0.85f : 1.0f;   // roads
-            if (!g_pathMask && g_treeDist && g_treeDist[nb] <= TREE_NEAR_DM) mul *= 6.0f;   // round a tree, not into it
-            if (!g_pathMask && g->edges[nb] != 0xff && !(g->flags[nb] & NAV_WATER)) mul *= 1.5f;   // beside a wall / edge: a cell off it where there is room
+            if (!pathMask && g_treeDist && g_treeDist[nb] <= TREE_NEAR_DM) mul *= 6.0f;   // round a tree, not into it
+            if (!pathMask && g->edges[nb] != 0xff && !(g->flags[nb] & NAV_WATER)) mul *= 1.5f;   // beside a wall / edge: a cell off it where there is room
             float cost = gs[cur] + step * mul + (climb > 0 ? climb * 2.0f : 0);
             if (CLOSED(nb)) continue;
             if (!SEEN(nb) || cost < gs[nb]) {
@@ -1674,8 +1786,7 @@ static int nav_find_path_once(const NavGrid *g, NavRayFn ray, float sx, float sy
              closedCount, g->height[start], g->height[goal]);
     if (!found && g_partialOk && nearNode >= 0 && nearNode != start) { goal = nearNode; found = 1; g_partialUsed = 1; }
     // Boxed in (the 2 m grid sees a tight spot as enclosed): plan from a nearby open node and walk to it first.
-    static int rescuing;
-    if (!found && closedCount < 64 && !rescuing && maxPts > 1 && !g_pathMask) {
+    if (!found && closedCount < 64 && !X->rescuing && maxPts > 1 && !g_pathMask) {
         int cx = (start / L) % g->w, cz = (start / L) / g->w, tries = 0;
         unsigned pocket = curStamp + 1;   // stamp of the nodes the failed search closed (nested searches use newer stamps)
         for (int r = 1; r <= 3 && tries < 3; r++)
@@ -1692,9 +1803,9 @@ static int nav_find_path_once(const NavGrid *g, NavRayFn ray, float sx, float sy
                         node_pos(g, node, p);
                         if (ray && !nav_segment_clear(ray, s, p)) continue;   // must be walkable to in a straight line
                         tries++;
-                        rescuing = 1;
+                        X->rescuing = 1;
                         int n = nav_find_path(g, ray, p[0], p[1], p[2], tx, ty, tz, out + 3, maxPts - 1);
-                        rescuing = 0;
+                        X->rescuing = 0;
                         if (n > 0) {
                             memcpy(out, p, sizeof p);
                             memmove(g_outLink + 1, g_outLink, sizeof g_outLink[0] * (size_t)(n < NAV_MAX_OUT - 1 ? n : NAV_MAX_OUT - 1));
@@ -1710,52 +1821,13 @@ static int nav_find_path_once(const NavGrid *g, NavRayFn ray, float sx, float sy
         int *nodes = nav_alloc(len * sizeof(int));
         int k = len;
         for (int c = goal; c >= 0; c = from[c]) nodes[--k] = c;
-        // String pulling from the bot's actual position: take the farthest node reachable in a straight line.
-        float from[3] = {sx, isnan(sy) ? g->height[start] : sy, sz};
-        int anchor = -1;
-        while (anchor < len - 1 && count < maxPts) {
-            int next = anchor + 1, limit = len - 1, link = -1;
-            if (anchor >= 0) link = link_between(g, nodes[anchor], nodes[anchor + 1]);
-            if (link < 0)   // the next link start is as far as a straight run may go
-                for (int j = anchor + 1; j < len - 1; j++) if (link_between(g, nodes[j], nodes[j + 1]) >= 0) { limit = j; break; }
-            if (link < 0)
-                for (int j = limit; j > next; j--) {
-                    if (j - anchor > (g_pathMask && !g_longLegs ? 8 : g_longLegs ? 250 : 64)) continue;   // cars: short legs on the road; boats: as long as the water allows
-                    if (anchor >= 0 && !straight_walkable(g, nodes[anchor], nodes[j])) continue;
-                    float to[3];
-                    node_pos(g, nodes[j], to);
-                    if (ray && !nav_segment_clear(ray, from, to)) continue;
-                    next = j;
-                    break;
-                }
-            if (link < 0 && next == anchor + 1 && anchor >= 0 && count < maxPts - 1) {   // through a doorway: via its gap
-                int a = nodes[anchor], b = nodes[next], ca = a / L, cb = b / L;
-                int ddx = cb % g->w - ca % g->w, ddz = cb / g->w - ca / g->w, dd = -1;
-                for (int k = 0; k < 8; k += 2) if (kDir[k][0] == ddx && kDir[k][1] == ddz) dd = k;
-                if (dd >= 0 && (g->fences[a] & (1 << (dd + 1)))) {
-                    float pa[3], pb[3], off = 0;
-                    node_pos(g, a, pa); node_pos(g, b, pb);
-                    for (int k = 0; k < 4 && ray; k++)
-                        if (pair_clear(ray, pa[0], pa[1], pa[2], pb[0], pb[1], pb[2], kDoorOffsets[k])) { off = kDoorOffsets[k]; break; }
-                    float dx = pb[0] - pa[0], dz = pb[2] - pa[2], ln = sqrtf(dx * dx + dz * dz);
-                    float *o = &out[count * 3];
-                    o[0] = (pa[0] + pb[0]) * 0.5f - dz / ln * off;
-                    o[1] = pa[1] > pb[1] ? pa[1] : pb[1];
-                    o[2] = (pa[2] + pb[2]) * 0.5f + dx / ln * off;
-                    if (count < NAV_MAX_OUT) g_outLink[count] = -1;
-                    memcpy(from, o, sizeof from);
-                    count++;
-                }
-            }
-            int startsLink = next < len - 1 && link_between(g, nodes[next], nodes[next + 1]) >= 0;
-            if (link >= 0) memcpy(&out[count * 3], g_links[link].b, 12);   // over the ladder: its exit spot
-            else if (startsLink) memcpy(&out[count * 3], g_links[link_between(g, nodes[next], nodes[next + 1])].a, 12);   // its foot
-            else node_pos(g, nodes[next], &out[count * 3]);
-            if (count < NAV_MAX_OUT) g_outLink[count] = (short)link;
-            memcpy(from, &out[count * 3], sizeof from);
-            count++;
-            anchor = next;
+        if (X->nodesOut) {   // the route worker: the raw chain - the game thread pulls the strings (its rays are the engine's)
+            int m = len < X->nodesMax ? len : X->nodesMax;
+            memcpy(X->nodesOut, nodes, (size_t)m * sizeof(int));
+            nav_release(nodes);
+            return m;
         }
+        count = nav_smooth_path(g, ray, sx, sy, sz, nodes, len, out, maxPts);
         nav_release(nodes);
     }
     #undef SEEN

@@ -1864,6 +1864,29 @@ static void reroute_from_here(int i, char *soldier, const char *why)
 // loads its own layers, props and play area): BotMod_nav_<map>_<mode>.bin, built on the mode's first run on that map. The mode
 // is the grid's own (set when it is loaded / made); the old one-per-map files are no longer used.
 static char g_navGridMode[48];
+// Survey caches (paving, materials, widths, trees) follow the grid's own key - "<level>_<mode>" (2026-10-25: named per level only,
+// Conquest's and Rush's grids of one map - different sizes - overwrote each other's every load: each load surveyed the map again,
+// ~90 s at 11-21 ticks/s). A file under the old per-level name still loads when its size fits.
+static const char *grid_key(const char *level)
+{
+    static char k[2][128];
+    static int w;
+    w ^= 1;
+    if (g_navGridMode[0]) snprintf(k[w], sizeof k[w], "%s_%s", level, g_navGridMode); else snprintf(k[w], sizeof k[w], "%s", level);
+    return k[w];
+}
+static FILE *cache_open_rb(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (f || !g_navGridMode[0]) return f;
+    char old[MAX_PATH + 160], suffix[64];
+    snprintf(suffix, sizeof suffix, "_%s.bin", g_navGridMode);
+    snprintf(old, sizeof old, "%s", path);
+    size_t lo = strlen(old), ls = strlen(suffix);
+    if (lo <= ls || _stricmp(old + lo - ls, suffix)) return NULL;
+    strcpy(old + lo - ls, ".bin");
+    return fopen(old, "rb");   // (the readers check its size against the grid)
+}
 static void nav_file(char *out, int n, const char *level)
 {
     char dir[MAX_PATH];
@@ -3034,6 +3057,7 @@ static int bot_ammo(int i, int slot);
 static int *wanted_bots(void);
 static void save_bot_count(void);
 static int g_rosterAuto;
+static int g_aaOff;
 static int player_squad(char *pl);
 static int squad_request_recent(char *pl);
 static int squad_objective(int team, int squad);
@@ -9403,6 +9427,7 @@ static DWORD WINAPI discovery_worker(LPVOID doLoadouts)
 
 static void tickets_reset(void);
 static void tickets_find(void);
+static int tickets_mode(void);
 static void hq_memory_apply(void);
 static int near_origin(const float *p) { return fabsf(p[0]) < 12.0f && fabsf(p[2]) < 12.0f; }
 static int pos_sane(const float *p) { return p && isfinite(p[0]) && isfinite(p[1]) && isfinite(p[2]) && fabsf(p[0]) < 20000.0f && fabsf(p[1]) < 20000.0f && fabsf(p[2]) < 20000.0f; }
@@ -9531,7 +9556,7 @@ static void level_tick(void)
     bot_log("level: %s ready - %d flags, HQ spawns US %p RU %p, blueprint %p", g_level, g_flagCount, H->teamSpawn[1].entity,
             H->teamSpawn[2].entity, g_jobBlueprint);
     tickets_reset();
-    tickets_find();
+    if (tickets_mode()) tickets_find();
     hq_memory_apply();
     teams_fix_all();
     NavGrid *g = *nav_slot();
@@ -11066,6 +11091,9 @@ __declspec(dllexport) void botmod_command(char *line)
         g_heliGo[k] = 1; g_heliGoal[k][0] = x; g_heliGoal[k][1] = z; g_heliLand[k] = 1; g_heliLandAt[k] = H->frame; g_heliShift[k] = 0;
         if (m) g_heliAlt[k] = m[13];   // (at the height it is: over the spot first)
         bot_log("heliland: %s -> lands at (%.0f, %.0f)", (char *)H->bots[k] + OFF_PLAYER_ONLINE_NAME, x, z);
+    } else if (!strcmp(line, "aa off") || !strcmp(line, "aa on")) {   // aa off / aa on: AA Defense bots out and kept out / back
+        g_aaOff = line[4] == 'f';
+        bot_log("aa: AA Defense bots %s", g_aaOff ? "off" : "on");
     } else if (!strncmp(line, "aalead ", 7)) {   // aalead <x>: the AA guns' lead multiplier
         g_aaLeadMul = (float)atof(line + 7);
         bot_log("aalead: %.2f", g_aaLeadMul);
@@ -12012,9 +12040,15 @@ static void roster_tick(void)
 // the moment its team is so full that a human slot is taken (a human joined), it leaves (before any roster bot does).
 // Its gun destroyed: it stays (dead) and gets back in when the gun respawns.
 #define AA_JOIN_DELAY_FRAMES (60 * 30)
+static int g_aaOff;   // "aa off" (the user, 2026-10-23 - trailer filming): no AA Defense bots until "aa on"
 static void aa_tick(void)
 {
     if (H->frame % 30 != 23) return;
+    if (g_aaOff) {
+        for (int i = 0; i < H->botCount; i++)
+            if (is_aa_bot(i) && !removal_pending(H->bots[i])) { bot_log("aa: %s leaves (aa off)", (char *)H->bots[i] + OFF_PLAYER_ONLINE_NAME); queue_bot_removal(i); }
+        return;
+    }
     static char aaLevel[64];
     static unsigned readySince;
     static unsigned char had[3];
@@ -13286,7 +13320,7 @@ static void pave_cache_path(char *out, int n, const char *level)
     char dir[MAX_PATH];
     GetModuleFileNameA(NULL, dir, sizeof dir);
     *strrchr(dir, '\\') = 0;
-    snprintf(out, n, "%s\\BotMod_pave_%s.bin", dir, level);
+    snprintf(out, n, "%s\\BotMod_pave_%s.bin", dir, grid_key(level));
 }
 static const unsigned char *drive_mask(void)
 {
@@ -13306,7 +13340,7 @@ static const unsigned char *drive_mask(void)
         if (g_driveMask) {
             char path[MAX_PATH + 64];
             pave_cache_path(path, sizeof path, g->level);
-            FILE *f = fopen(path, "rb");
+            FILE *f = cache_open_rb(path);
             int hdr[3] = {0, 0, 0}, cells = g->w * g->h * NAV_LAYERS;
             if (f) {
                 if (fread(hdr, 4, 3, f) == 3 && hdr[0] == g->w && hdr[1] == g->h && hdr[2] == NAV_LAYERS &&
@@ -13334,7 +13368,7 @@ static void mat_cache_path(char *out, int n, const char *level)
     char dir[MAX_PATH];
     GetModuleFileNameA(NULL, dir, sizeof dir);
     *strrchr(dir, '\\') = 0;
-    snprintf(out, n, "%s\\BotMod_mat2_%s.bin", dir, level);   // (mat2: materials + props)
+    snprintf(out, n, "%s\\BotMod_mat2_%s.bin", dir, grid_key(level));   // (mat2: materials + props)
 }
 static void mat_survey_tick(void)
 {
@@ -13351,7 +13385,7 @@ static void mat_survey_tick(void)
         g_matFor = g->serial; g_matDone = 0; g_matCursor = 0;
         if (!g_nodeMat || !g_nodeObst) { g_matCursor = -1; return; }
         mat_cache_path(path, sizeof path, g->level);
-        FILE *f = fopen(path, "rb");
+        FILE *f = cache_open_rb(path);
         int hdr[3];
         if (f) {
             if (fread(hdr, 4, 3, f) == 3 && hdr[0] == g->w && hdr[1] == g->h && hdr[2] == NAV_LAYERS && fread(g_nodeMat, 2, (size_t)n, f) == (size_t)n &&
@@ -13417,7 +13451,7 @@ static void width_cache_path(char *out, int n, const char *level)
     char dir[MAX_PATH];
     GetModuleFileNameA(NULL, dir, sizeof dir);
     *strrchr(dir, '\\') = 0;
-    snprintf(out, n, "%s\\BotMod_width_%s.bin", dir, level);
+    snprintf(out, n, "%s\\BotMod_width_%s.bin", dir, grid_key(level));
 }
 static void width_apply(const NavGrid *g)
 {
@@ -13442,7 +13476,7 @@ static void width_survey_tick(void)
         g_widthFor = g->serial; g_widthCursor = 0; g_widthApplied = 0;
         if (!g_nodeNarrow) { g_widthCursor = -1; return; }
         width_cache_path(path, sizeof path, g->level);
-        FILE *f = fopen(path, "rb");
+        FILE *f = cache_open_rb(path);
         int hdr[3];
         if (f) {
             if (fread(hdr, 4, 3, f) == 3 && hdr[0] == g->w && hdr[1] == g->h && hdr[2] == NAV_LAYERS && fread(g_nodeNarrow, 1, (size_t)n, f) == (size_t)n) {
@@ -13677,8 +13711,8 @@ static void tree_tick(void)
         char path[MAX_PATH + 64], dir[MAX_PATH];   // surveyed before (same grid size): straight from the file
         GetModuleFileNameA(NULL, dir, sizeof dir);
         *strrchr(dir, '\\') = 0;
-        snprintf(path, sizeof path, "%s\\BotMod_trees_%s.bin", dir, g->level);
-        FILE *f = fopen(path, "rb");
+        snprintf(path, sizeof path, "%s\\BotMod_trees_%s.bin", dir, grid_key(g->level));
+        FILE *f = cache_open_rb(path);
         if (f) {
             int hdr[3] = {0, 0, 0};
             if (fread(hdr, 4, 3, f) == 3 && hdr[0] == g->w && hdr[1] == g->h && hdr[2] == NAV_LAYERS && fread(g_treeDist, 1, (size_t)n, f) == (size_t)n) {
@@ -13729,7 +13763,7 @@ static void tree_tick(void)
             char path[MAX_PATH + 64], dir[MAX_PATH];
             GetModuleFileNameA(NULL, dir, sizeof dir);
             *strrchr(dir, '\\') = 0;
-            snprintf(path, sizeof path, "%s\\BotMod_trees_%s.bin", dir, g->level);
+            snprintf(path, sizeof path, "%s\\BotMod_trees_%s.bin", dir, grid_key(g->level));
             FILE *f = g_treeCount ? fopen(path, "wb") : NULL;
             if (f) { int hdr[3] = {g->w, g->h, NAV_LAYERS}; fwrite(hdr, 4, 3, f); fwrite(g_treeDist, 1, (size_t)n, f); fclose(f); }
         }
@@ -14949,6 +14983,10 @@ static void cse_scan(void)
         unsigned *p = (unsigned *)mbi.BaseAddress, *e = (unsigned *)((char *)mbi.BaseAddress + mbi.RegionSize);
         for (; p < e && g_cseCount < 64; p++)
             if (*p == CSE_VTABLE && *(unsigned *)(CSE_VTABLE + 0x6c) == ADDR_CSE_SPAWN) g_cse[g_cseCount++] = p;
+    }
+    if (strcmp(g_cseLevel, g_level)) {   // a new level: forget the last one's spawner groups (heap addresses get reused - with all 4 slots
+        memset(g_cseGroup, 0, sizeof g_cseGroup);   //  full of old levels' groups nothing new was learnt: XP5_004's F-16s counted as RU's,
+        memset(g_cseGroupTeam, 0, sizeof g_cseGroupTeam);   //  every RU bot spawned in one and the US bots got no jet, 2026-10-25)
     }
     strncpy(g_cseLevel, g_level, sizeof g_cseLevel - 1);
     bot_log("air: %d spawn entities on %s", g_cseCount, g_level);
@@ -17718,6 +17756,173 @@ static char *route_vehicle_ahead(DriveState *d, const float *vp, float range, fl
     if (along) *along = bestAl;
     return best;
 }
+// ---- Vehicle route worker (the user, 2026-10-25: "move it to a background thread"): a vehicle route's A* over the whole map took
+// 140-476 ms on the game thread - with 50 bots a hitch every 20 s or so. One search at a time runs on this thread: the planner hands
+// over the grid, a copy of the mask and the blockers, start and goal, and waits (the vehicle stopped) while it runs; the next tick the
+// planner runs again, finds the result and pulls the strings itself (that needs the engine's rays - game thread only). Other vehicles
+// due a plan wait their turn. A grid is never freed under a search (nav_free waits for it); the DLL's unload stops the thread.
+#define VJ_MAX_NODES 8192
+#define VJ_MEMO 8   // searches one plan may make (the main one, then the fallbacks: landings, a ladder, the shallows, open water, tank / infantry)
+// A plan is a SESSION: the planner runs again each tick until it is done; its k-th search (in order - the planner does the same steps
+// with the same inputs each run) is answered from the session's memo once the worker has done it, else handed to the worker (pending:
+// the planner stops there and runs again next tick). One session at a time; other vehicles due a plan wait (a session nobody touched
+// for half a second, or whose owner is no longer planning, is over).
+typedef struct { int valid, len, partialUsed; unsigned serial; float s[3], t[3]; char err[128]; int nodes[VJ_MAX_NODES]; } VjMemo;
+static VjMemo g_vjMemo[VJ_MEMO];
+static struct { int active, owner, call; char *veh; unsigned touched; } g_vjS;
+static struct {
+    volatile LONG state;            // 0 idle, 1 queued, 2 searching, 3 done
+    int bot, call;
+    char *veh;
+    const NavGrid *g;
+    unsigned serial;
+    float s[3], t[3];
+    unsigned char *mask;
+    size_t maskCap;
+    int hasMask, longLegs, nblk, partial, partialUsed;
+    float half, hmul, blk[32][4];
+    int nodes[VJ_MAX_NODES], len;
+    double ms;
+    char err[128];
+} g_vj;
+static HANDLE g_vjThread, g_vjWake;
+static volatile LONG g_vjQuit;
+static DWORD WINAPI vj_worker(LPVOID arg)
+{
+    (void)arg;
+    nav_set_worker_thread(GetCurrentThreadId());
+    while (!g_vjQuit) {
+        WaitForSingleObject(g_vjWake, 200);
+        if (g_vjQuit) break;
+        if (InterlockedCompareExchange(&g_vj.state, 2, 1) != 1) continue;
+        double t0 = perf_now();
+        nav_set_path_mask(g_vj.hasMask ? g_vj.mask : NULL);
+        nav_set_long_legs(g_vj.longLegs);
+        nav_set_vehicle_state(g_vj.half, g_vj.hmul);
+        nav_set_blockers(g_vj.nblk ? &g_vj.blk[0][0] : NULL, g_vj.nblk);
+        nav_set_partial(g_vj.partial);
+        g_vj.len = nav_find_nodes(g_vj.g, g_vj.s[0], g_vj.s[1], g_vj.s[2], g_vj.t[0], g_vj.t[1], g_vj.t[2], g_vj.nodes, VJ_MAX_NODES);
+        g_vj.partialUsed = nav_partial_used();
+        snprintf(g_vj.err, sizeof g_vj.err, "%s", nav_last_error());
+        nav_set_partial(0);
+        nav_set_path_mask(NULL);
+        nav_set_blockers(NULL, 0);
+        g_vj.ms = perf_now() - t0;
+        MemoryBarrier();
+        InterlockedExchange(&g_vj.state, 3);
+    }
+    return 0;
+}
+static void vj_wait_grid(const NavGrid *g)   // nav_free: never free a grid the worker is searching
+{
+    if (!g_vjThread || g_vj.g != g) return;
+    for (int k = 0; k < 400 && (g_vj.state == 1 || g_vj.state == 2); k++) {
+        if (g_vj.state == 1 && InterlockedCompareExchange(&g_vj.state, 0, 1) == 1) break;   // (not started: dropped)
+        Sleep(5);
+    }
+    if (g_vj.state == 3) g_vj.state = 0;
+    g_vj.g = NULL;
+    g_vjS.active = 0;
+}
+static void vj_stop(void)
+{
+    if (!g_vjThread) return;
+    InterlockedExchange(&g_vjQuit, 1);
+    SetEvent(g_vjWake);
+    if (WaitForSingleObject(g_vjThread, 3000) == WAIT_TIMEOUT) bot_log("WARNING: vehicle route worker still running at unload");
+    CloseHandle(g_vjThread); g_vjThread = NULL;
+    if (g_vjWake) { CloseHandle(g_vjWake); g_vjWake = NULL; }
+    nav_set_free_hook(NULL);
+}
+// For bot i's vehicle at the planner's gate: 0 no session (plan as usual - rate limits, then vj_begin), 1 its search is running (wait),
+// 2 its session goes on (run the planner again - vj_rerun), 3 another vehicle's session / search is in the way (wait).
+static int vj_status(int i, char *veh)
+{
+    if (g_vjS.active && (H->frame - g_vjS.touched > 15 || g_drive[g_vjS.owner].phase != 2 || g_drive[g_vjS.owner].veh != g_vjS.veh)) g_vjS.active = 0;   // (over)
+    if (!g_vjS.active && g_vj.state == 3) g_vj.state = 0;   // (a finished session's last result: nobody wants it)
+    int mine = g_vjS.active && g_vjS.owner == i && g_vjS.veh == veh;
+    if (mine) g_vjS.touched = H->frame;
+    if (g_vjS.active && !mine) return 3;
+    if (g_vj.state == 1 || g_vj.state == 2) return mine ? 1 : 3;
+    return mine ? 2 : 0;
+}
+static void vj_begin(int i, char *veh)
+{
+    g_vjS.active = 1; g_vjS.owner = i; g_vjS.veh = veh; g_vjS.call = 0; g_vjS.touched = H->frame;
+    for (int k = 0; k < VJ_MEMO; k++) g_vjMemo[k].valid = 0;
+}
+static void vj_rerun(int i) { (void)i; g_vjS.call = 0; g_vjS.touched = H->frame; }
+static int vj_smooth(int i, NavGrid *g, const float *from, VjMemo *m, float *out, int maxPts, double ms)
+{
+    int n = m->len ? nav_smooth_path(g, ray_cast, from[0], from[1], from[2], m->nodes, m->len, out, maxPts) : 0;
+    nav_set_last_error(m->err);
+    nav_set_partial_used(m->partialUsed);
+    if (ms > 50.0) bot_log("perf: %s's vehicle route searched in %.0f ms off the game thread (%d node(s), %d point(s))",
+                           (char *)H->bots[i] + OFF_PLAYER_ONLINE_NAME, ms, m->len, n);
+    return n;
+}
+// One of the planner's route searches: -1 = handed to the worker (stop, run again next tick), else the route's point count (0: none).
+// The mask, long legs, partial flag and blockers are the planner's current ones (as for nav_find_path).
+static int vj_route(int i, char *veh, NavGrid *g, const float *from, const float *to, float *out, int maxPts)
+{
+    int mine = g_vjS.active && g_vjS.owner == i && g_vjS.veh == veh;
+    int k = mine ? g_vjS.call++ : VJ_MEMO;
+    if (k >= VJ_MEMO) return nav_find_path(g, ray_cast, from[0], from[1], from[2], to[0], to[1], to[2], out, maxPts);   // (no session / too many: as before)
+    g_vjS.touched = H->frame;
+    VjMemo *m = &g_vjMemo[k];
+    #define VJ_NEAR(a, b, r) (((a)[0] - (b)[0]) * ((a)[0] - (b)[0]) + ((a)[2] - (b)[2]) * ((a)[2] - (b)[2]) < (r) * (r))
+    if (m->valid && m->serial == g->serial && VJ_NEAR(m->t, to, 3.0f) && VJ_NEAR(m->s, from, 25.0f)) return vj_smooth(i, g, from, m, out, maxPts, 0);
+    if (g_vj.state == 3 && g_vj.bot == i && g_vj.veh == veh && g_vj.call == k) {
+        int same = g_vj.g == g && g_vj.serial == g->serial && VJ_NEAR(g_vj.t, to, 3.0f) && VJ_NEAR(g_vj.s, from, 25.0f);
+        if (same) {
+            m->valid = 1; m->len = g_vj.len; m->partialUsed = g_vj.partialUsed; m->serial = g_vj.serial;
+            memcpy(m->s, g_vj.s, 12); memcpy(m->t, g_vj.t, 12);
+            snprintf(m->err, sizeof m->err, "%s", g_vj.err);
+            memcpy(m->nodes, g_vj.nodes, (size_t)g_vj.len * sizeof(int));
+            double ms = g_vj.ms;
+            g_vj.state = 0;
+            return vj_smooth(i, g, from, m, out, maxPts, ms);
+        }
+        g_vj.state = 0;   // (its start / goal moved on meanwhile: search again)
+    }
+    #undef VJ_NEAR
+    if (g_vj.state != 0) return -1;
+    if (!g_vjThread) {
+        g_vjQuit = 0;
+        if (!g_vjWake) g_vjWake = CreateEventA(NULL, FALSE, FALSE, NULL);
+        g_vjThread = g_vjWake ? CreateThread(NULL, 0, vj_worker, NULL, 0, NULL) : NULL;
+        if (!g_vjThread) return nav_find_path(g, ray_cast, from[0], from[1], from[2], to[0], to[1], to[2], out, maxPts);   // (no thread: as before)
+        nav_set_free_hook(vj_wait_grid);
+        bot_log("drive: vehicle route worker started");
+    }
+    const unsigned char *mk = nav_path_mask();
+    size_t n = (size_t)g->w * g->h * NAV_LAYERS;
+    g_vj.hasMask = mk != NULL;
+    if (mk) {
+        if (g_vj.maskCap != n) { if (g_vj.mask) HeapFree(GetProcessHeap(), 0, g_vj.mask); g_vj.mask = HeapAlloc(GetProcessHeap(), 0, n); g_vj.maskCap = g_vj.mask ? n : 0; }
+        if (!g_vj.mask) return nav_find_path(g, ray_cast, from[0], from[1], from[2], to[0], to[1], to[2], out, maxPts);
+        memcpy(g_vj.mask, mk, n);   // (the planner's masks get rebuilt / freed - the worker reads its own copy)
+    }
+    g_vj.bot = i; g_vj.veh = veh; g_vj.call = k; g_vj.g = g; g_vj.serial = g->serial;
+    memcpy(g_vj.s, from, 12); memcpy(g_vj.t, to, 12);
+    g_vj.longLegs = nav_long_legs();
+    g_vj.partial = nav_partial_ok();
+    nav_vehicle_state(&g_vj.half, &g_vj.hmul);
+    g_vj.nblk = nav_get_blockers(&g_vj.blk[0][0], 32);
+    g_vj.len = 0; g_vj.err[0] = 0;
+    MemoryBarrier();
+    InterlockedExchange(&g_vj.state, 1);
+    SetEvent(g_vjWake);
+    return -1;
+}
+// The planner's searches go through this: a pending one stops the vehicle and ends this run of the planner (it runs again next tick).
+#define VJ_PATH(var, fx, fy, fz, tx, ty, tz, outp, maxp, cleanup) do { \
+        float f_[3] = {(fx), (fy), (fz)}, t_[3] = {(tx), (ty), (tz)}; \
+        int r_ = vj_route(i, d->veh, g, f_, t_, (outp), (maxp)); \
+        if (r_ < 0) { cleanup; nav_set_path_mask(NULL); nav_set_long_legs(0); nav_set_partial(0); \
+                      H->botMove[i][0] = veh_stop_input(i, d->veh); H->botMove[i][2] = 0; return; } \
+        (var) = r_; \
+    } while (0)
 static void drive_tick_body(int i);
 static int vehicle_is_amphib(char *veh);
 static void drive_tick(int i)
@@ -17921,12 +18126,13 @@ static void drive_tick_body(int i)
     if (d->phase == 2) {   // vehicle route plans, rate-limited: one every 10 ticks across the server, each vehicle every 4 s at most (Kharg,
         // 2026-10-23: amphibious plans took 330-370 ms each, several a second - the game thread stalled and server 3 went down)
         static unsigned lastPlan, vehPlan[MAX_BOTS];
-        if ((lastPlan && H->frame - lastPlan < 10) || (vehPlan[i] && H->frame - vehPlan[i] < 4 * 30)) {
+        int vjs = vj_status(i, d->veh);   // (the route worker: its search running / another vehicle's plan - wait; its plan goes on - run again)
+        if (vjs == 1 || vjs == 3 || (vjs == 0 && ((lastPlan && H->frame - lastPlan < 10) || (vehPlan[i] && H->frame - vehPlan[i] < 4 * 30)))) {
             H->botMove[i][0] = veh_stop_input(i, d->veh); H->botMove[i][2] = 0;
             return;
         }
-        lastPlan = H->frame ? H->frame : 1;
-        vehPlan[i] = lastPlan;
+        if (vjs == 0) { lastPlan = H->frame ? H->frame : 1; vehPlan[i] = lastPlan; if (!d->taxi || vehicle_is_boat(d->veh)) vj_begin(i, d->veh); }
+        else vj_rerun(i);
     }
     if (d->phase == 2 && d->taxi && !vehicle_is_boat(d->veh)) {   // a taxi: roads, 3 m clear - nothing else
         NavGrid *g = *nav_slot();
@@ -18042,7 +18248,8 @@ static void drive_tick_body(int i)
         }
         nav_set_long_legs(boat);
         double planT0 = perf_now();
-        d->n = have ? nav_find_path(g, ray_cast, vp[0], vp[1], vp[2], tgt[0], tgt[1], tgt[2], d->pts, DRIVE_MAX_PTS) : 0;
+        d->n = 0;
+        if (have) VJ_PATH(d->n, vp[0], vp[1], vp[2], tgt[0], tgt[1], tgt[2], d->pts, DRIVE_MAX_PTS, (void)0);
         static unsigned amphFailAt[MAX_BOTS];   // (its landing searches found nothing: not again for 20 s - each one scans the whole map)
         if (!d->n && have && !boat && vehicle_is_amphib(d->veh) && !(amphFailAt[i] && H->frame - amphFailAt[i] < 20 * 30)) {   // an amphibian with no route over land and water as one: by water to
             // a landing on the land that DRIVES on to the objective, then ashore (the user, 2026-10-22: two came ashore on Kharg in a pocket
@@ -18069,10 +18276,11 @@ static void drive_tick_body(int i)
             int wsOk = bm && nav_mask_nearest(g, bm, vp[0], vp[2], 40.0f, ws);
             if (glab && wsOk && nav_landing_on(g, bm, dl, glab, vp[0], vp[2], tgt[0], tgt[2], 1.0f, 0.0f, w)) {
                 nav_set_path_mask(bm); nav_set_long_legs(1);
-                int na = nav_find_path(g, ray_cast, ws[0], ws[1], ws[2], w[0], w[1], w[2], d->pts, DRIVE_MAX_PTS - 16);
+                int na = 0;
+                VJ_PATH(na, ws[0], ws[1], ws[2], w[0], w[1], w[2], d->pts, DRIVE_MAX_PTS - 16, (void)0);
                 nav_set_long_legs(0);
                 int nb = 0;
-                if (na) { nav_set_path_mask(dm); nb = nav_find_path(g, ray_cast, w[0], w[1], w[2], tgt[0], tgt[1], tgt[2], d->pts + na * 3, DRIVE_MAX_PTS - na); }
+                if (na) { nav_set_path_mask(dm); VJ_PATH(nb, w[0], w[1], w[2], tgt[0], tgt[1], tgt[2], d->pts + na * 3, DRIVE_MAX_PTS - na, (void)0); }
                 nav_set_path_mask(mask);
                 if (na && nb) d->n = na + nb;
                 bot_log("drive: %s's %s lands at (%.0f, %.0f), %.0f m from its goal on the land that drives there - %s", pl + OFF_PLAYER_ONLINE_NAME,
@@ -18084,7 +18292,7 @@ static void drive_tick_body(int i)
                 float lw[3];
                 if (goalLand && nav_landing_on(g, boat_mask(), g_landLabels, goalLand, vp[0], vp[2], tgt[0], tgt[2], 4.0f, 60.0f, lw)) {
                     nav_set_path_mask(bm); nav_set_long_legs(1);
-                    d->n = nav_find_path(g, ray_cast, ws[0], ws[1], ws[2], lw[0], lw[1], lw[2], d->pts, DRIVE_MAX_PTS);
+                    VJ_PATH(d->n, ws[0], ws[1], ws[2], lw[0], lw[1], lw[2], d->pts, DRIVE_MAX_PTS, (void)0);
                     nav_set_long_legs(0);
                     nav_set_path_mask(mask);
                     if (d->n) bot_log("drive: %s's %s lands like a boat at (%.0f, %.0f), %.0f m from its goal - the rest on foot", pl + OFF_PLAYER_ONLINE_NAME,
@@ -18110,7 +18318,7 @@ static void drive_tick_body(int i)
                 Ladder *la = &g_ladders[best];
                 float lt[3] = {la->foot[0] + la->fwd[0] * 2.5f, vp[1], la->foot[2] + la->fwd[2] * 2.5f};
                 nav_set_path_mask(mask);
-                d->n = nav_find_path(g, ray_cast, vp[0], vp[1], vp[2], lt[0], lt[1], lt[2], d->pts, DRIVE_MAX_PTS);
+                VJ_PATH(d->n, vp[0], vp[1], vp[2], lt[0], lt[1], lt[2], d->pts, DRIVE_MAX_PTS, (void)0);
                 if (d->n) {
                     memcpy(tgt, lt, sizeof lt);
                     bot_log("drive: %s cannot reach its landing - makes for the ladder at (%.0f, %.0f), its top %.0f m from the flag", pl + OFF_PLAYER_ONLINE_NAME,
@@ -18122,14 +18330,14 @@ static void drive_tick_body(int i)
             bot_log("drive: %s finds no route 6 m clear of land - allows the shallows", pl + OFF_PLAYER_ONLINE_NAME);
             nav_set_path_mask(mask);
             nav_set_partial(1);   // (a landing behind a quay wall: as near as the water goes - they walk the rest)
-            d->n = nav_find_path(g, ray_cast, vp[0], vp[1], vp[2], tgt[0], tgt[1], tgt[2], d->pts, DRIVE_MAX_PTS);
+            VJ_PATH(d->n, vp[0], vp[1], vp[2], tgt[0], tgt[1], tgt[2], d->pts, DRIVE_MAX_PTS, (void)0);
             if (d->n && nav_partial_used()) bot_log("drive: %s cannot reach its landing by water - goes as near as the water allows (%.0f m short)", pl + OFF_PLAYER_ONLINE_NAME,
                                                     sqrtf(dist2(&d->pts[(d->n - 1) * 3], tgt)));
             nav_set_partial(0);
         }
         float ow[3];
         if (have && !d->n && boat && nav_open_water_near(g, mask, vp[0], vp[2], 80.0f, ow)) {   // docked in a pocket (pier posts):
-            d->n = nav_find_path(g, ray_cast, ow[0], ow[1], ow[2], tgt[0], tgt[1], tgt[2], d->pts + 3, DRIVE_MAX_PTS - 1);   // out to open water first
+            VJ_PATH(d->n, ow[0], ow[1], ow[2], tgt[0], tgt[1], tgt[2], d->pts + 3, DRIVE_MAX_PTS - 1, (void)0);   // out to open water first
             if (d->n) { memcpy(d->pts, ow, 12); d->n++; bot_log("drive: %s backs out to open water at (%.0f, %.0f) first", pl + OFF_PLAYER_ONLINE_NAME, ow[0], ow[2]); }
         }
         nav_set_path_mask(NULL);
@@ -18163,7 +18371,7 @@ static void drive_tick_body(int i)
                     }
                 }
                 nav_set_path_mask(vm ? vm : g_tankMask);
-                d->n = nav_find_path(g, ray_cast, vp[0], vp[1], vp[2], tgt[0], tgt[1], tgt[2], d->pts, DRIVE_MAX_PTS);
+                VJ_PATH(d->n, vp[0], vp[1], vp[2], tgt[0], tgt[1], tgt[2], d->pts, DRIVE_MAX_PTS, if (vm) HeapFree(GetProcessHeap(), 0, vm));
                 nav_set_path_mask(NULL);
                 if (vm) HeapFree(GetProcessHeap(), 0, vm);
                 float stopS = d->flag < 0 ? 4.0f : PILOT_STOP_SHORT;
@@ -18175,7 +18383,7 @@ static void drive_tick_body(int i)
             // (never an amphibian: the infantry route swam a LAV and an AAV into a pocket by Kharg's ship, 2026-10-22)
             // the mountains; on open ground a tank follows it fine: Alborz's steep snow left only drivable islands)
             const char *why = nav_last_error();
-            d->n = nav_find_path(g, ray_cast, vp[0], vp[1], vp[2], tgt[0], tgt[1], tgt[2], d->pts, DRIVE_MAX_PTS);
+            VJ_PATH(d->n, vp[0], vp[1], vp[2], tgt[0], tgt[1], tgt[2], d->pts, DRIVE_MAX_PTS, (void)0);
             float stopS = d->flag < 0 ? 4.0f : PILOT_STOP_SHORT;
             for (int k = 0; k < d->n; k++) if (dist2(&d->pts[k * 3], d->goal) < stopS * stopS) { d->n = k + 1; break; }
             if (d->n) bot_log("drive: %s has no drivable-mask route (%s) - takes the infantry route (%d points)", pl + OFF_PLAYER_ONLINE_NAME, why, d->n);
@@ -18615,11 +18823,15 @@ static void tickets_take(int team, float n)
     *t = *t - n > 0 ? *t - n : 0;
     g_ticketsSet[team] = *t;
 }
+// Ticket counters exist (and BotMod's bleed means something) only where flags are fought over: Conquest, Air / Tank Superiority. The
+// search is a ~250 ms memory scan on the game thread - on Rush / CTF it never finds any and retried every 5 s, 12 times a level: a
+// minute of 250 ms hitches after every map load and reload (2026-10-25).
+static int tickets_mode(void) { return !is_rush_mode() && !is_ctf_mode() && !is_dm_mode(); }
 static void tickets_tick(void)
 {
     if (!g_ticketsOn && !g_roundEnded && g_level[0] && H->frame - g_ticketsLookAt > 5 * 30) {   // counters not there at level ready
         g_ticketsLookAt = H->frame;                                                              // (round restart): look again
-        if (g_ticketsTries++ < 12) tickets_find();
+        if (g_ticketsTries++ < 12 && tickets_mode()) tickets_find();
     }
     if (g_roundEnded && g_roundEndedAt && H->frame - g_roundEndedAt > 15 * 30) {   // endRound is ignored on this server
         g_roundEndedAt = 0;                                                         // (pre-round disabled): next map
@@ -18874,13 +19086,19 @@ __declspec(dllexport) void botmod_tick(void)
     }
     { double t = perf_now(); perf_add(PF_LEVEL, t - tMark); tMark = t; }
     if (!level_ready()) { perf_add(PF_TOTAL, perf_now() - tStart); return; }   // level loading / changing: leave everything alone
-    hq_learn_tick();
+    // (each timed: one over 100 ms is named in the log - the "roster" bucket holds all of these; 190-230 ms spikes at 50 bots, 2026-10-25)
+    #define SLOW_CALL(call) do { double t0_ = perf_now(); call; double ms_ = perf_now() - t0_; \
+        if (ms_ > 100.0) bot_log("perf: %s took %.0f ms (%d bots)", #call, ms_, H->botCount); } while (0)
+    SLOW_CALL(hq_learn_tick());
     if (g_levelReady && H->frame % 30 == 7 && *nav_slot() && (*nav_slot())->phase == 2) {
-        int back = nav_unblock_expired(*nav_slot(), 0);
+        int back = 0;
+        SLOW_CALL(back = nav_unblock_expired(*nav_slot(), 0));
         if (back) bot_log("nav: %d link(s) blocked at stuck spots 3 minutes ago are open again", back);
     }
-    if (g_levelReady) { tickets_tick(); swim_tick(); tree_tick(); if (!g_driveOff) { drive_mask(); drive_pave_tick(); drive_strikes_tick(); mat_survey_tick(); width_survey_tick(); roadwatch_tick(); squad_vehicle_tick(); solo_vehicle_tick(); } }
-    if (g_readdCount) readd_bots();
+    if (g_levelReady) { SLOW_CALL(tickets_tick()); SLOW_CALL(swim_tick()); SLOW_CALL(tree_tick());
+        if (!g_driveOff) { SLOW_CALL(drive_mask()); SLOW_CALL(drive_pave_tick()); SLOW_CALL(drive_strikes_tick()); SLOW_CALL(mat_survey_tick()); SLOW_CALL(width_survey_tick());
+                           SLOW_CALL(roadwatch_tick()); SLOW_CALL(squad_vehicle_tick()); SLOW_CALL(solo_vehicle_tick()); } }
+    if (g_readdCount) SLOW_CALL(readd_bots());
     // After a server start, bring up the 8-bot roster automatically (unless BotMod_autoroster.off exists).
     static int autoRosterDone;
     if (!autoRosterDone && H->botCount == 0) {
@@ -18938,8 +19156,8 @@ __declspec(dllexport) void botmod_tick(void)
         if (!s || H->frame > until) { g_testVictim = NULL; until = 0; }
     }
     g_where = "roster/squads/downed/nav";
-    roster_tick();
-    aa_tick();
+    SLOW_CALL(roster_tick());
+    SLOW_CALL(aa_tick());
     { double t = perf_now(); perf_add(PF_ROSTER, t - tMark); tMark = t; }
     if (level_ready()) occupant_death_tick();   // (before anything boards this frame)
     squad_tick();
@@ -19341,6 +19559,7 @@ __declspec(dllexport) void botmod_shutdown(void)
         CloseHandle(g_jobThread); g_jobThread = NULL;
     }
     chat_stop();
+    vj_stop();   // (its code goes away with this DLL)
     if (g_compThread) {
         if (WaitForSingleObject(g_compThread, 3000) == WAIT_TIMEOUT) bot_log("WARNING: scan worker still running at unload");
         CloseHandle(g_compThread); g_compThread = NULL;
