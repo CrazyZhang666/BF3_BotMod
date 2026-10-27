@@ -136,6 +136,14 @@ static NavGrid *new_grid(void)
     return g;
 }
 static void nav_release(void *p) { if (p) HeapFree(GetProcessHeap(), 0, p); }
+void nav_release_search_buffers(void)   // the A* buffers of both threads (a core unload: they leaked ~16 bytes a node each reload)
+{
+    for (int k = 0; k < 2; k++) {
+        NavCtx *X = &g_navCtx[k];
+        nav_release(X->gs); nav_release(X->from); nav_release(X->stamp); nav_release(X->heap);
+        X->gs = NULL; X->from = NULL; X->stamp = NULL; X->heap = NULL; X->bufN = 0;
+    }
+}
 
 static void alloc_arrays(NavGrid *g)
 {
@@ -307,6 +315,28 @@ static int pair_clear(NavRayFn ray, float ax, float ha, float az, float bx, floa
     return 1;
 }
 static const float kDoorOffsets[4] = {0.5f, -0.5f, 0.9f, -0.9f};
+// A doorway is one a BODY fits through: the line at the offset and 0.35 m either side of it clear (one line slipped past the
+// edge of a 2 m door - Noshahr's RU base, 2026-10-26: the cells above and below a one-cell door both got "doorway" links, a dozen
+// bots walked into the wall beside it at every round start)
+#define DOOR_HALF_BODY 0.35f
+static int door_gap_ok(NavRayFn ray, float ax, float ha, float az, float bx, float hb, float bz, float off)
+{
+    if (!pair_clear(ray, ax, ha, az, bx, hb, bz, off) || !pair_clear(ray, ax, ha, az, bx, hb, bz, off - DOOR_HALF_BODY) ||
+        !pair_clear(ray, ax, ha, az, bx, hb, bz, off + DOOR_HALF_BODY)) return 0;
+    // ...and the step SIDEWAYS onto that line, at both ends (a line 0.9 m over ran on the far side of the pocket's own wall - a
+    // "doorway" south out of a corner nobody can walk; Noshahr 2026-10-26)
+    float dx = bx - ax, dz = bz - az, len = sqrtf(dx * dx + dz * dz);
+    if (len < 0.01f) return 1;
+    float side = off + (off > 0 ? DOOR_HALF_BODY : -DOOR_HALF_BODY);
+    float px = -dz / len * side, pz = dx / len * side;
+    const float heights[2] = {KNEE_HEIGHT, CHEST_HEIGHT};
+    for (int k = 0; k < 2; k++) {
+        float a0[3] = {ax, ha + heights[k], az}, a1[3] = {ax + px, ha + heights[k], az + pz};
+        float b0[3] = {bx, hb + heights[k], bz}, b1[3] = {bx + px, hb + heights[k], bz + pz};
+        if (ray(a0, a1, NULL, NULL) || ray(b0, b1, NULL, NULL)) return 0;
+    }
+    return 1;
+}
 
 // Layer of neighbour cell `nc` that node (c, l) can drop down to when there is no step: the highest walkable surface
 // between MAX_STEP_UP and MAX_DROP below it.
@@ -381,8 +411,8 @@ static int probe_edge(NavGrid *g, NavRayFn ray, int cell, int d)
         }
         if (blocked && !(d & 1)) {   // a doorway beside the centre line? (straight directions)
             for (int k = 0; k < 4 && blocked; k++) {
-                rays += 2;
-                if (pair_clear(ray, ax, ha, az, bx, hb, bz, kDoorOffsets[k])) {
+                rays += 6;
+                if (door_gap_ok(ray, ax, ha, az, bx, hb, bz, kDoorOffsets[k])) {
                     blocked = 0;
                     g->fences[node] |= (unsigned char)(1 << (d + 1));
                     g->fences[nc * L + nl] |= (unsigned char)(1 << (d + 5));
@@ -544,6 +574,8 @@ static int step_node(const NavGrid *g, int node, int d)
     return nl < 0 ? -1 : nc * L + nl;
 }
 int nav_step_node(const NavGrid *g, int node, int d) { return step_node(g, node, d); }
+static int nearest_node(const NavGrid *g, float x, float y, float z);
+int nav_nearest_node(const NavGrid *g, float x, float y, float z) { return nearest_node(g, x, y, z); }
 
 
 // Connected walkable node near (x, y, z): nearest cell within a few cells, layer closest to y (NAN = lowest).
@@ -1111,6 +1143,80 @@ int nav_fix_hull_step(NavGrid *g, NavRayFn ray, int rayBudget, int *cut)
 
 // A link forced both ways between the nodes nearest a and b (neighbouring cells, straight): a staircase the checks miss (BotMod_navlinks.txt).
 // 1 done, 0 not neighbours / no nodes.
+// Doorway links of a grid built before door_gap_ok: re-tested a slice at a time (rayBudget rays a call); a link whose centre line is
+// blocked and no body-wide gap is found is removed both ways. Returns 1 when the whole grid is done; *cut counts removals.
+// Remove-only re-test of the links round a stuck bot: every same-level link in the box whose centre line is blocked and (a straight one)
+// has no body-wide gap beside it is cut, both ways. Never adds a link (the build's probe, used here first, re-created a false 2.6 m
+// "staircase" over a wall stub the stair re-check had just removed - Noshahr, 2026-10-26). Returns the links cut.
+int nav_cut_blocked_around(NavGrid *g, NavRayFn ray, float x0, float z0, float x1, float z1)
+{
+    int c0 = nav_cell_index(g, x0, z0), c1 = nav_cell_index(g, x1, z1), cut = 0;
+    if (c0 < 0 || c1 < 0) return 0;
+    int ax = c0 % g->w, az = c0 / g->w, bx = c1 % g->w, bz = c1 / g->w;
+    if (ax > bx) { int t = ax; ax = bx; bx = t; }
+    if (az > bz) { int t = az; az = bz; bz = t; }
+    for (int cz = az; cz <= bz; cz++)
+        for (int cx = ax; cx <= bx; cx++)
+            for (int l = 0; l < L; l++) {
+                int node = (cz * g->w + cx) * L + l;
+                if (!(g->flags[node] & NAV_WALKABLE)) continue;
+                for (int d = 0; d < 8; d++) {
+                    if (!(g->edges[node] & (1 << d))) continue;
+                    int nb = step_node(g, node, d);
+                    if (nb < 0 || fabsf(g->height[nb] - g->height[node]) > MAX_STEP_UP) continue;   // (climbs / drops: the stair checks' business)
+                    float pa[3], pb[3];
+                    node_pos(g, node, pa); node_pos(g, nb, pb);
+                    if (pair_clear(ray, pa[0], pa[1], pa[2], pb[0], pb[1], pb[2], 0.0f)) continue;
+                    int ok = 0;
+                    for (int k = 0; k < 4 && !ok && !(d & 1); k++) if (door_gap_ok(ray, pa[0], pa[1], pa[2], pb[0], pb[1], pb[2], kDoorOffsets[k])) ok = 1;
+                    if (ok) continue;
+                    g->edges[node] &= (unsigned char)~(1 << d);
+                    g->edges[nb] &= (unsigned char)~(1 << ((d + 4) & 7));
+                    if (!(d & 1)) { g->fences[node] &= (unsigned char)~(1 << (d + 1)); g->fences[nb] &= (unsigned char)~(1 << ((d + 5) & 7)); }
+                    cut++;
+                }
+            }
+    return cut;
+}
+int nav_fix_doors_step(NavGrid *g, NavRayFn ray, int rayBudget, int *cut)
+{
+    static const NavGrid *forG;
+    static int cursor;
+    if (forG != g) { forG = g; cursor = 0; }
+    int n = g->w * g->h * L, rays = 0;
+    for (; cursor < n && rays < rayBudget; cursor++) {
+        int node = cursor;
+        if (!(g->flags[node] & NAV_WALKABLE) || !g->fences[node]) continue;
+        for (int d = 0; d < 8; d += 2) {
+            if (!(g->fences[node] & (1 << (d + 1)))) continue;   // a doorway link this way...
+            int blk = -1;                                        // ...open, or taken out for now by a stuck-bot block (it would come back
+            for (int k = 0; k < MAX_NAV_BLOCKS && blk < 0; k++)  //  when the block ends / with every save: a phantom kept returning, Noshahr)
+                if (g_blocks[k].g == g && block_ok(g, k) && ((g_blocks[k].node == node && g_blocks[k].d == d) || (g_blocks[k].nb == node && ((g_blocks[k].d + 4) & 7) == d))) blk = k;
+            if (!(g->edges[node] & (1 << d)) && blk < 0) continue;
+            int had = g->edges[node] & (1 << d);
+            if (!had) g->edges[node] |= (unsigned char)(1 << d);   // (step_node needs the link to find the neighbour)
+            int nb = step_node(g, node, d);
+            if (!had) g->edges[node] &= (unsigned char)~(1 << d);
+            if (nb < 0) continue;
+            float pa[3], pb[3];
+            node_pos(g, node, pa); node_pos(g, nb, pb);
+            rays += 2;
+            if (pair_clear(ray, pa[0], pa[1], pa[2], pb[0], pb[1], pb[2], 0.0f)) continue;   // (the centre line is clear: an ordinary link)
+            int ok = 0;
+            for (int k = 0; k < 4 && !ok; k++) { rays += 6; if (door_gap_ok(ray, pa[0], pa[1], pa[2], pb[0], pb[1], pb[2], kDoorOffsets[k])) ok = 1; }
+            if (ok) continue;
+            if (blk >= 0) g_blocks[blk].g = NULL;   // (its block too: nothing puts it back)
+            int back = (d + 4) & 7;
+            g->edges[node] &= (unsigned char)~(1 << d);
+            g->fences[node] &= (unsigned char)~(1 << (d + 1));
+            g->edges[nb] &= (unsigned char)~(1 << back);
+            g->fences[nb] &= (unsigned char)~(1 << ((d + 5) & 7));
+            (*cut)++;
+        }
+    }
+    return cursor >= n;
+}
+
 int nav_force_link(NavGrid *g, const float *a, const float *b)
 {
     int na = nearest_node(g, a[0], a[1], a[2]), nb = nearest_node(g, b[0], b[1], b[2]);
@@ -1622,7 +1728,7 @@ int nav_smooth_path(const NavGrid *g, NavRayFn ray, float sx, float sy, float sz
                     float pa[3], pb[3], off = 0;
                     node_pos(g, a, pa); node_pos(g, b, pb);
                     for (int k = 0; k < 4 && ray; k++)
-                        if (pair_clear(ray, pa[0], pa[1], pa[2], pb[0], pb[1], pb[2], kDoorOffsets[k])) { off = kDoorOffsets[k]; break; }
+                        if (door_gap_ok(ray, pa[0], pa[1], pa[2], pb[0], pb[1], pb[2], kDoorOffsets[k])) { off = kDoorOffsets[k]; break; }
                     float dx = pb[0] - pa[0], dz = pb[2] - pa[2], ln = sqrtf(dx * dx + dz * dz);
                     float *o = &out[count * 3];
                     o[0] = (pa[0] + pb[0]) * 0.5f - dz / ln * off;
@@ -1692,6 +1798,12 @@ static int nav_find_path_once(const NavGrid *g, NavRayFn ray, float sx, float sy
         X->heap = nav_alloc(X->heapCap * sizeof(HeapItem));
         X->bufN = n;
         X->curStamp = 0;
+        if (!X->gs || !X->from || !X->stamp || !X->heap) {   // (out of address space - a 32-bit server near 3 GB: the search wrote through a NULL
+            nav_release(X->gs); nav_release(X->from); nav_release(X->stamp); nav_release(X->heap);   //  open list and server 3 went down, 2026-10-27)
+            X->gs = NULL; X->from = NULL; X->stamp = NULL; X->heap = NULL; X->bufN = 0;
+            snprintf(g_lastError, sizeof g_lastError, "out of memory for the search buffers");
+            return 0;
+        }
     }
     float *gs = X->gs;
     int *from = X->from, heapCap = X->heapCap;

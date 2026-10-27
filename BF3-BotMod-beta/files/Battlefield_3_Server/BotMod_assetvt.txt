@@ -89,3 +89,4 @@
 02504b34 Weapons/UMP45/U_UMP45
 02504b1c Weapons/UMP45/U_UMP45_CAMO_1
 02504b34 Weapons/Sa18IGLA/U_Sa18IGLA
+02504b6c Persistence/Unlocks/Vehicles/JetMaverickMissiles

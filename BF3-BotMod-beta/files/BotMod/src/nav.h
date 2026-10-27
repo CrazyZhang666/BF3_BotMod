@@ -96,6 +96,9 @@ int nav_fix_stairs_step(NavGrid *g, NavRayFn ray, int rayBudget, int *removed);
 // Water under something (a ship's hull and decks, a pier): a link from such a water node to its neighbour is cut if a ray just over the
 // water hits between them - a hull wall at the waterline, not open water under a bridge. Incremental: 1 when done (*cut: links cut).
 int nav_fix_hull_step(NavGrid *g, NavRayFn ray, int rayBudget, int *cut);
+int nav_cut_blocked_around(NavGrid *g, NavRayFn ray, float x0, float z0, float x1, float z1);   // remove-only re-test round a stuck bot
+void nav_release_search_buffers(void);   // (core unload)
+int nav_fix_doors_step(NavGrid *g, NavRayFn ray, int rayBudget, int *cut);   // doorway links a body does not fit through: removed
 int nav_force_link(NavGrid *g, const float *a, const float *b);   // a staircase link both ways between neighbouring cells (manual)
 int nav_hull_restored(void);   // links the last nav_fix_hull_step pass put back (clear now)
 void nav_set_path_mask(const unsigned char *mask);
@@ -107,6 +110,7 @@ void nav_set_blockers(const float *xyzr, int n);
 void nav_set_tree_dist(const NavGrid *g, const unsigned char *dist);
 // The node a step in direction d (0..7) leads to, if the grid connects them (-1 otherwise).
 int nav_step_node(const NavGrid *g, int node, int d);
+int nav_nearest_node(const NavGrid *g, float x, float y, float z);
 // Drop links the last stair re-check put back (ones an older version deleted as "false staircases").
 int nav_stairs_restored(void);
 // Nodes the last re-check found to be handrail / wall tops (no floor half a metre to two sides) and made unwalkable.
